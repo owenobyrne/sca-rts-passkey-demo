@@ -52,11 +52,11 @@ A suggested run-through:
 
 ## Enabling GitHub Pages
 
-The workflow in `.github/workflows/pages.yml` publishes the repository root on every push. It
-needs Pages switched to the Actions source once:
-
-1. **Settings → Pages → Build and deployment → Source: GitHub Actions**.
-2. Push (or re-run the workflow from the Actions tab).
+The workflow in `.github/workflows/pages.yml` publishes the repository root on every push, and
+passes `enablement: true` to `actions/configure-pages`, so it switches Pages on (source: GitHub
+Actions) by itself the first time it runs — no manual setup. If your organisation restricts that,
+set it by hand instead under **Settings → Pages → Build and deployment → Source: GitHub Actions**
+and re-run the workflow.
 
 The site is plain static files, so **Deploy from a branch** works just as well if you prefer it —
 the `.nojekyll` file is there so Jekyll does not eat anything.
