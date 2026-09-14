@@ -26,12 +26,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      # Requires Pages to be switched on once, by hand, with the GitHub Actions
+      # source: Settings -> Pages -> Build and deployment. The workflow token
+      # cannot create the Pages site itself (that needs repository admin), so
+      # this step fails with "Get Pages site failed" until that is done.
       - name: Configure Pages
-        # enablement: switches Pages on (source: GitHub Actions) the first time
-        # this runs, so the repository needs no manual setup step.
         uses: actions/configure-pages@v5
-        with:
-          enablement: true
 
       - name: Upload site artifact
         uses: actions/upload-pages-artifact@v3
