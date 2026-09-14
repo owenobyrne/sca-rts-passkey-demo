@@ -154,6 +154,13 @@ Supported, and a first-class flow: **hybrid transport** (cross-device authentica
 the desktop, camera on the phone, Bluetooth proximity, assertion back through an encrypted tunnel.
 The proximity step is what stops an attacker relaying a QR code to a distant victim.
 
+**To try it in the demo:** press *Use a phone or security key* in step 1 on the desktop, scan the
+QR code, approve on the phone. That button asks for `authenticatorAttachment: "cross-platform"`,
+which is the entirety of the site's influence — whether the phone is *remembered* for next time is
+negotiated between the phone and the browser, and no site can request, observe or depend on it. If
+no QR appears, check Bluetooth at both ends, and remember a passkey is scoped to one relying party:
+one enrolled on `localhost` will not work on the hosted copy.
+
 **But a passkey on a phone is not a second channel.** The phone's prompt names the site, not the
 amount or payee — hybrid changes where the key lives, not what the customer can verify. It does
 not close the gap above; that still needs an app that renders the transaction on the phone.

@@ -139,7 +139,11 @@ export class BankServer {
    * @param {boolean} [tuning.payment]      request the SPC `payment` extension
    * @param {number[]} [tuning.algorithms]  COSE algorithms to offer, in order
    */
-  beginRegistration({ payment = true, algorithms = [COSE_ALG.ES256, COSE_ALG.EdDSA, COSE_ALG.RS256] } = {}) {
+  beginRegistration({
+    payment = true,
+    algorithms = [COSE_ALG.ES256, COSE_ALG.EdDSA, COSE_ALG.RS256],
+    attachment = null,
+  } = {}) {
     const challenge = randomBytes(32);
     this.registrationChallenge = challenge;
 
@@ -160,9 +164,24 @@ export class BankServer {
       authenticatorSelection: {
         residentKey: 'preferred',
         userVerification: 'required',
+        // Steering only. "cross-platform" tells the browser to skip this
+        // machine's built-in authenticator and go to the QR code or a security
+        // key; omitting it lets the browser offer everything. A relying party
+        // can express a preference and nothing more — the picker belongs to
+        // the browser, and a site that could silently choose the authenticator
+        // would be a phishing primitive.
+        ...(attachment ? { authenticatorAttachment: attachment } : {}),
       },
+      // WebAuthn Level 3 hints, ignored by browsers that predate them.
+      ...(attachment
+        ? { hints: attachment === 'cross-platform' ? ['hybrid', 'security-key'] : ['client-device'] }
+        : {}),
       attestation: 'none',
-      timeout: 120000,
+      // A local biometric is a couple of seconds; scanning a QR code means
+      // picking up the phone, unlocking it and opening the camera. WebAuthn
+      // suggests around 300s where user verification is required, and rushing
+      // a cross-device enrolment into 120s is how people end up retrying.
+      timeout: attachment === 'cross-platform' ? 300000 : 120000,
       extensions: {
         credProps: true,
         // Marks the credential as usable by Secure Payment Confirmation.

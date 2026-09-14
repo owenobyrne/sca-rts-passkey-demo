@@ -377,9 +377,16 @@ for (const transport of ['ble', 'usb']) {
   });
 
   await roaming.goto(BASE, { waitUntil: 'networkidle' });
-  await roaming.click('#btn-register');
+  // The "use a phone or security key" path: cross-platform attachment skips a
+  // built-in authenticator, which is exactly what a roaming one is.
+  await roaming.click('#btn-register-cross');
   await roaming.waitForSelector('.cred h3', { timeout: 20000 });
-  check(`a ${transport} credential enrols`, new RegExp(transport).test(await roaming.locator('#cred-list').innerText()));
+  check(`a ${transport} credential enrols via the cross-device path`, new RegExp(transport).test(await roaming.locator('#cred-list').innerText()));
+  check(
+    `the ${transport} request asked for cross-platform attachment`,
+    /"attachment":"cross-platform"/.test(await roaming.locator('#audit-log').innerText()),
+    await roaming.locator('#audit-log').innerText(),
+  );
 
   await roaming.click('#scenarios .scenario[data-scenario="payment"]');
   await roaming.click('#btn-assess');
@@ -397,6 +404,26 @@ for (const transport of ['ble', 'usb']) {
   check(`no page errors on the ${transport} path`, roamingErrors.length === 0, roamingErrors.join(' | '));
   await roamingContext.close();
 }
+
+// A cross-platform request must not be satisfied by a built-in authenticator:
+// the browser has to go looking for a phone or a key instead.
+const platformOnly = await browser.newContext();
+const platformPage = await platformOnly.newPage();
+const platformCdp = await platformOnly.newCDPSession(platformPage);
+await platformCdp.send('WebAuthn.enable');
+await platformCdp.send('WebAuthn.addVirtualAuthenticator', { options: AUTHENTICATOR }); // transport: internal
+await platformPage.goto(BASE, { waitUntil: 'networkidle' });
+await platformPage.click('#btn-register-cross');
+// The browser parks on its cross-device UI waiting for a phone or key rather
+// than quietly using the built-in authenticator, so the request stays pending:
+// assert that nothing was enrolled locally, then abandon it.
+await platformPage.waitForTimeout(3000);
+check(
+  'an internal authenticator does not answer a cross-platform request',
+  (await platformPage.locator('.cred h3').count()) === 0,
+  await platformPage.locator('#cred-list').innerText(),
+);
+await platformOnly.close();
 
 // --- state written by an earlier version of the demo -----------------------
 // The three-scenario rewrite changed the ledger shape. State persists in

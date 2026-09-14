@@ -306,10 +306,10 @@ function renderCredentials() {
   const creds = server.credentials;
   if (!creds.length) {
     list.innerHTML = '<p class="placeholder">No passkey enrolled yet. Enrolment is what binds a public key to this relying party.</p>';
-    $('btn-register').textContent = 'Create passkey';
+    $('btn-register').textContent = 'Create passkey on this device';
     return;
   }
-  $('btn-register').textContent = 'Enrol another passkey';
+  $('btn-register').textContent = 'Enrol another on this device';
   list.innerHTML = creds
     .map((c) => {
       const chips = [
@@ -357,7 +357,7 @@ function renderCredentials() {
  * NotSupportedError on a user agent with no SPC implementation, which would
  * otherwise block enrolment outright rather than merely disabling SPC.
  */
-function registrationVariants() {
+function registrationVariants(attachment = null) {
   const variants = [];
   if (env.paymentRequest) {
     variants.push({ note: 'ES256/EdDSA/RS256 with the SPC payment extension', tuning: { payment: true } });
@@ -368,23 +368,29 @@ function registrationVariants() {
     tuning: { payment: false, algorithms: [COSE_ALG.ES256, COSE_ALG.RS256] },
   });
   variants.push({ note: 'ES256 only', tuning: { payment: false, algorithms: [COSE_ALG.ES256] } });
-  return variants;
+  return variants.map((variant) => ({
+    ...variant,
+    note: attachment ? `${variant.note}, ${attachment}` : variant.note,
+    tuning: { ...variant.tuning, attachment },
+  }));
 }
 
-async function onRegister() {
-  const button = $('btn-register');
-  button.disabled = true;
-  $('register-hint').textContent = 'Follow your device prompt…';
+async function onRegister(attachment = null) {
+  const buttons = [$('btn-register'), $('btn-register-cross')];
+  buttons.forEach((b) => (b.disabled = true));
+  $('register-hint').textContent = attachment === 'cross-platform' ? 'Scan the QR code with your phone…' : 'Follow your device prompt…';
   try {
     let credential = null;
     let accepted = null;
     let lastError = null;
 
-    for (const variant of registrationVariants()) {
+    for (const variant of registrationVariants(attachment)) {
       const options = server.beginRegistration(variant.tuning);
       log('step', `POST /webauthn/register/begin → ${variant.note}`, {
         rpId: options.rp.id,
         userVerification: options.authenticatorSelection.userVerification,
+        attachment: options.authenticatorSelection.authenticatorAttachment ?? 'any',
+        hints: options.hints ?? [],
         algs: options.pubKeyCredParams.map((param) => param.alg),
         extensions: Object.keys(options.extensions),
       });
@@ -424,13 +430,13 @@ async function onRegister() {
       <div>
         <h3>Registration failed</h3>
         <p>${esc(friendlyWebauthnError(error))}</p>
-        <p class="hint">Every fallback was tried: ${esc(registrationVariants().map((v) => v.note).join('; '))}. This browser reports secure context ${
+        <p class="hint">Every fallback was tried: ${esc(registrationVariants(attachment).map((v) => v.note).join('; '))}. This browser reports secure context ${
           env.secureContext ? 'yes' : 'no'
         }, platform authenticator ${env.platformAuthenticator ? 'yes' : 'no'}, origin ${esc(env.origin)}.</p>
       </div>
     </div>`;
   } finally {
-    button.disabled = false;
+    buttons.forEach((b) => (b.disabled = false));
     $('register-hint').textContent = '';
   }
 }
@@ -1031,7 +1037,8 @@ async function init() {
     $(scenario.formId).addEventListener('submit', onSubmit);
   }
 
-  $('btn-register').addEventListener('click', onRegister);
+  $('btn-register').addEventListener('click', () => onRegister(null));
+  $('btn-register-cross').addEventListener('click', () => onRegister('cross-platform'));
   $('btn-export').addEventListener('click', exportAudit);
   $('btn-clear-log').addEventListener('click', () => {
     auditLog.length = 0;

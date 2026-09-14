@@ -48,9 +48,11 @@
       <div class="card-body">
         <div id="cred-list" class="cred-list" aria-live="polite"></div>
         <div class="row">
-          <button type="button" class="btn primary" id="btn-register">Create passkey</button>
+          <button type="button" class="btn primary" id="btn-register">Create passkey on this device</button>
+          <button type="button" class="btn" id="btn-register-cross">Use a phone or security key</button>
           <span class="hint" id="register-hint"></span>
         </div>
+        <p class="hint">The second button asks for <code>authenticatorAttachment: "cross-platform"</code>, so the browser skips this machine’s built-in authenticator and offers the QR code instead. Scan it with your phone and the passkey is created there. That request is a <em>preference</em>: the picker belongs to the browser, and whether your phone is remembered for next time is decided by the phone and the browser, never by this site.</p>
         <div id="reg-result"></div>
       </div>
     </section>
@@ -319,6 +321,8 @@
             <p>This works, and it is a first-class flow: <strong>hybrid transport</strong>, also called cross-device authentication. The desktop shows a QR code, the phone scans it, the two prove physical proximity over Bluetooth, and the assertion travels back through an encrypted tunnel. Every current desktop browser supports it, with iOS and Android acting as the authenticator.</p>
             <p>The Bluetooth proximity step is not decoration. It is what stops an attacker relaying a QR code to a distant victim: the phone will only complete the exchange with a device that is physically beside it, so a QR shown on a phishing page cannot be redeemed from somewhere else.</p>
             <p><strong>But a passkey on a phone is not a second channel.</strong> The phone’s prompt names the site, exactly as a local prompt would — it does not show the amount or the payee. Reaching for your phone <em>feels</em> like out-of-band transaction confirmation, and it is not: hybrid moves where the key lives, not what the customer gets to verify. Closing the gap described above still needs an application that renders the transaction on the phone and takes the approval there.</p>
+            <p><strong>To try it here:</strong> on the desktop, press <em>Use a phone or security key</em> in step 1, scan the QR code the browser shows, and approve on the phone — the passkey is created there, in iCloud Keychain or Google Password Manager. Every later step in the demo will then offer it. That button asks for <code>authenticatorAttachment: "cross-platform"</code>, which is the whole of the site’s influence: whether your phone is <em>remembered</em> for next time is negotiated between the phone and the browser, and no site can request it, observe it, or rely on it. Chrome with an Android phone generally offers to remember; a QR-based iPhone pairing generally does not.</p>
+            <p>Two things to check if the QR never appears: Bluetooth must be on at both ends, and a passkey is scoped to one relying party — one enrolled against <code>localhost</code> will not work on the hosted copy, or the other way round.</p>
             <p>Expect friction. Unless the desktop and phone are linked, or the passkey already syncs to the desktop through the same platform account, it is QR plus camera plus Bluetooth on every authentication — noticeably slower than typing an SMS code, and paid on every payment. The usual answer is to enrol a passkey on the desktop as well and keep the phone for bootstrapping and recovery.</p>
             <p>Two deployment blockers worth checking before committing: corporate builds that disable Bluetooth or the camera cannot do hybrid at all, and virtual desktop environments often cannot reach a local authenticator without specific WebAuthn redirection. Finance teams are disproportionately likely to be working in exactly those environments.</p>
           </div>
