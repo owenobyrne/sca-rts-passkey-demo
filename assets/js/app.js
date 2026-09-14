@@ -723,7 +723,7 @@ function renderChecklist(checks) {
 
 function renderVerification(result, executionPayload, replayed) {
   $('step-verify').classList.remove('is-idle');
-  const scenario = SCENARIOS[executionPayload.type === 'login' ? 'login' : executionPayload.type];
+  const scenario = SCENARIOS[executionPayload.type] ?? SCENARIOS[flow.scenario];
 
   const failedLinking = result.checks.find((c) => c.id === 'dynamic-linking' && c.status === STATUS.FAIL);
   const verdict = result.ok
@@ -829,6 +829,23 @@ function renderCounters() {
     <p class="hint">Article 16 lets a payment through without SCA only while one of these counters still has room. Applying SCA resets both.</p>`;
 }
 
+/**
+ * Ledger entries can outlive the shape that wrote them — state persists in
+ * localStorage across deploys. Never let an unrecognised entry take the page
+ * down with it.
+ */
+function describeEntry(entry) {
+  const scenario = SCENARIOS[entry?.kind];
+  if (scenario) {
+    try {
+      return scenario.describe(entry.subject ?? {});
+    } catch {
+      /* fall through to the generic description */
+    }
+  }
+  return { headline: 'Earlier action', detail: entry?.subject?.payee?.name ?? entry?.kind ?? '' };
+}
+
 function renderLedger() {
   const entries = server.ledger.slice(0, 8);
   if (!entries.length) {
@@ -837,7 +854,7 @@ function renderLedger() {
   }
   $('ledger').innerHTML = entries
     .map((e) => {
-      const described = SCENARIOS[e.kind].describe(e.subject);
+      const described = describeEntry(e);
       return `<div class="ledger-item">
         <div class="top">
           <span class="amt">${esc(described.headline)}</span>
@@ -992,6 +1009,20 @@ init().catch((error) => {
   console.error(error);
   document.body.insertAdjacentHTML(
     'afterbegin',
-    `<div class="wrap notice-bar"><p><strong>The demo failed to start.</strong> ${esc(String(error))}</p></div>`,
+    `<div class="wrap notice-bar">
+      <p>
+        <strong>The demo failed to start.</strong> ${esc(String(error))}
+        <br>This is almost always state left by an earlier version of the demo.
+        <button type="button" class="btn tiny ghost" id="btn-recover" style="margin-top:8px">Clear stored demo state and reload</button>
+      </p>
+    </div>`,
   );
+  document.getElementById('btn-recover')?.addEventListener('click', () => {
+    try {
+      localStorage.removeItem('sca-rts-demo/bank-state/v1');
+    } catch {
+      /* nothing more we can do */
+    }
+    location.reload();
+  });
 });

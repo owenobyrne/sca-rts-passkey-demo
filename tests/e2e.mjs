@@ -291,6 +291,51 @@ check('enrols on a browser without PaymentRequest', /no payment extension/.test(
 check('SPC extension is omitted rather than retried into', !/with the SPC payment extension/.test(bareLog));
 await bareContext.close();
 
+// --- state written by an earlier version of the demo -----------------------
+// The three-scenario rewrite changed the ledger shape. State persists in
+// localStorage across deploys, so an unmigrated entry must not break startup.
+const legacyContext = await browser.newContext();
+const legacy = await legacyContext.newPage();
+const legacyErrors = [];
+legacy.on('pageerror', (error) => legacyErrors.push(error.message));
+await legacy.addInitScript(() => {
+  localStorage.setItem(
+    'sca-rts-demo/bank-state/v1',
+    JSON.stringify({
+      user: { id: 'AAAAAAAAAAAAAAAAAAAAAA', name: 'legacy@example.eu', displayName: 'Legacy User' },
+      credentials: {},
+      lowValueCounters: { amountEur: 24, count: 2 },
+      seq: 2,
+      ledger: [
+        {
+          sequence: 2,
+          executedAt: '2026-01-01T00:00:00Z',
+          authenticated: true,
+          exemption: null,
+          credentialId: 'legacy-credential',
+          signCount: 3,
+          transaction: {
+            schema: 'sca-rts-demo/transaction/1',
+            txnId: 'TX-legacy',
+            amount: '48.00',
+            currency: 'EUR',
+            payee: { name: 'Legacy Payee Ltd', iban: 'IE29AIBK93115212345678' },
+            reference: 'OLD-1',
+          },
+        },
+      ],
+    }),
+  );
+});
+await legacy.goto(BASE, { waitUntil: 'networkidle' });
+check('the demo starts with state from an earlier version', (await legacy.locator('#scenarios').count()) === 1);
+check('no startup error banner is shown', !/failed to start/i.test(await legacy.locator('body').innerText()));
+check('a legacy ledger entry is migrated and rendered', /Legacy Payee Ltd/.test(await legacy.locator('#ledger').innerText()), await legacy.locator('#ledger').innerText());
+check('legacy Art. 16 counters survive the migration', /€24\.00 of €100/.test(await legacy.locator('#counters').innerText()));
+check('the migrated page is usable', await legacy.locator('#form-login').isVisible());
+check('no page errors on the migrated state', legacyErrors.length === 0, legacyErrors.join(' | '));
+await legacyContext.close();
+
 check('no uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
 
 await browser.close();

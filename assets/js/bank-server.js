@@ -33,6 +33,7 @@ import {
 import { decode as cborDecode } from './cbor.js';
 
 const STORAGE_KEY = 'sca-rts-demo/bank-state/v1';
+const STATE_VERSION = 2;
 const CHALLENGE_TTL_MS = 5 * 60 * 1000; // Art. 4(3)(b): authentication codes are short-lived.
 
 const PASS = 'pass';
@@ -51,7 +52,30 @@ function emptyState() {
     lowValueCounters: { amountEur: 0, count: 0 },
     ledger: [],
     seq: 0,
+    version: STATE_VERSION,
   };
+}
+
+/**
+ * Upgrade state written by an earlier version of the demo.
+ *
+ * Version 1 predates the three-scenario model: its ledger entries are payments
+ * with no `kind` and no `subject`, and there is no session or beneficiary
+ * state. Migrating beats discarding, because the customer's enrolled
+ * credentials live in here too — and a stored shape the code cannot read must
+ * never be able to stop the page from loading.
+ */
+function migrate(parsed) {
+  const state = { ...emptyState(), ...parsed };
+  if (parsed?.version === STATE_VERSION) return state;
+
+  state.ledger = (Array.isArray(parsed?.ledger) ? parsed.ledger : []).map((entry) => {
+    const subject = entry?.subject ?? entry?.transaction ?? {};
+    const kind = entry?.kind ?? subject.type ?? (subject.payee || subject.amount ? 'payment' : 'unknown');
+    return { ...entry, kind, subject: { ...subject, type: kind } };
+  });
+  state.version = STATE_VERSION;
+  return state;
 }
 
 export class BankServer {
@@ -68,9 +92,10 @@ export class BankServer {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
       if (!raw) return emptyState();
-      const parsed = JSON.parse(raw);
-      return { ...emptyState(), ...parsed };
-    } catch {
+      return migrate(JSON.parse(raw));
+    } catch (error) {
+      // Corrupt or unreadable state is not worth a broken page.
+      this.log?.('warn', 'Stored demo state could not be read; starting fresh', String(error));
       return emptyState();
     }
   }
