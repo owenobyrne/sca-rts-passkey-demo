@@ -44,6 +44,10 @@ function emptyState() {
   return {
     user: { id: b64uEncode(randomBytes(16)), name: 'owen.demo@example.eu', displayName: 'Owen O’Byrne' },
     credentials: {},
+    // Art. 10 state: when SCA was last applied, and whether this customer has
+    // ever authenticated on this channel.
+    session: { signedInAt: null, lastScaAt: null, accessCount: 0 },
+    beneficiaries: {},
     lowValueCounters: { amountEur: 0, count: 0 },
     ledger: [],
     seq: 0,
@@ -243,16 +247,23 @@ export class BankServer {
    * knows the transaction from precomputing it; the canonical encoding keeps
    * the hash reproducible on verification.
    */
-  async createAuthorisationChallenge(transaction, { scaDecision } = {}) {
+  async createAuthorisationChallenge(subject, { scaDecision, bind = true } = {}) {
     const nonce = randomBytes(32);
-    const canonical = canonicalJson(transaction);
-    const challenge = await sha256(concatBytes(nonce, textEncoder.encode(canonical)));
+    const canonical = bind ? canonicalJson(subject) : null;
+    // An unbound action — signing in — has no amount or payee to commit to, so
+    // the challenge is simply unpredictable. Binding is what Art. 5 adds on top
+    // for payments; it is not what makes a challenge safe in the first place.
+    const challenge = bind
+      ? await sha256(concatBytes(nonce, textEncoder.encode(canonical)))
+      : randomBytes(32);
     const challengeB64u = b64uEncode(challenge);
 
     const context = {
       challenge: challengeB64u,
       nonce: b64uEncode(nonce),
-      transaction,
+      bound: bind,
+      subject,
+      transaction: subject,
       canonical,
       issuedAt: Date.now(),
       expiresAt: Date.now() + CHALLENGE_TTL_MS,
@@ -355,7 +366,15 @@ export class BankServer {
 
     let recomputed = null;
     let linkingStatus = SKIP;
-    if (context) {
+    if (context && !context.bound) {
+      add(
+        'dynamic-linking',
+        'Dynamic linking not applicable to this action',
+        SKIP,
+        'A sign-in has no amount and no payee to bind. RTS Art. 5 governs remote electronic payment transactions; the protection here comes from the challenge being unpredictable, single-use and origin-bound.',
+        'RTS Art. 5(1)',
+      );
+    } else if (context) {
       const canonicalExecuted = canonicalJson(executionPayload);
       recomputed = b64uEncode(
         await sha256(concatBytes(b64uDecode(context.nonce), textEncoder.encode(canonicalExecuted))),
@@ -363,7 +382,7 @@ export class BankServer {
       linkingStatus = recomputed === clientData.challenge && !context.consumed ? PASS : FAIL;
       add(
         'dynamic-linking',
-        'Transaction to be executed re-hashes to the signed challenge',
+        'Action to be carried out re-hashes to the signed challenge',
         linkingStatus,
         linkingStatus === PASS
           ? 'Amount and payee are unchanged since the payer authorised them.'
@@ -383,7 +402,7 @@ export class BankServer {
         }
       }
     } else {
-      add('dynamic-linking', 'Transaction to be executed re-hashes to the signed challenge', SKIP, 'No challenge context to re-hash against.', 'RTS Art. 5(1)(a)-(c)');
+      add('dynamic-linking', 'Action to be carried out re-hashes to the signed challenge', SKIP, 'No challenge context to re-hash against.', 'RTS Art. 5(1)(a)-(c)');
     }
 
     // --- Secure Payment Confirmation: browser-enforced visual dynamic linking
@@ -496,7 +515,7 @@ export class BankServer {
     }
 
     const receipt = ok
-      ? this.#execute(executionPayload, { context, authData, clientData, credentialId })
+      ? this.#apply(executionPayload, { context, authData, clientData, credentialId })
       : null;
 
     if (ok && record) {
@@ -521,45 +540,84 @@ export class BankServer {
     };
   }
 
-  #execute(transaction, meta) {
-    this.state.seq += 1;
-    const entry = {
-      sequence: this.state.seq,
-      executedAt: nowIso(),
-      transaction,
+  /** Carry out an authenticated action, once every verification check passed. */
+  #apply(subject, meta) {
+    const entry = this.#record(subject, {
       authenticated: true,
       method: meta.clientData?.type ?? 'webauthn.get',
-      exemption: null,
       credentialId: meta.credentialId,
       signCount: meta.authData.signCount,
-    };
-    this.state.ledger.unshift(entry);
-    // Art. 16: the running counters reset once SCA has been applied.
-    this.state.lowValueCounters = { amountEur: 0, count: 0 };
+      exemption: null,
+    });
+
+    const now = Date.now();
+    if (subject.type === 'login') {
+      this.state.session = { signedInAt: now, lastScaAt: now, accessCount: this.state.session.accessCount + 1 };
+    } else if (subject.type === 'beneficiary') {
+      this.state.beneficiaries[subject.beneficiaryId] = { ...subject, addedAt: nowIso(), authenticated: true };
+    } else {
+      // Art. 16: the running counters reset once SCA has been applied.
+      this.state.lowValueCounters = { amountEur: 0, count: 0 };
+    }
+
     this.#save();
     return entry;
   }
 
-  /** Execute a payment that an RTS exemption let through without SCA. */
-  executeExempt(transaction, decision, amountEur) {
-    this.state.seq += 1;
-    const entry = {
-      sequence: this.state.seq,
-      executedAt: nowIso(),
-      transaction,
+  /** Carry out an action that an exemption let through without SCA. */
+  applyExempt(subject, decision, amountEur) {
+    const entry = this.#record(subject, {
       authenticated: false,
       exemption: decision.chosenExemption,
       credentialId: null,
-    };
-    this.state.ledger.unshift(entry);
-    if (decision.chosenExemption?.article === 'Art. 16') {
+    });
+
+    if (subject.type === 'login') {
+      // Art. 10 resumption does not refresh lastScaAt: the window runs from the
+      // last SCA, not from the last exempted access.
+      this.state.session = {
+        ...this.state.session,
+        signedInAt: Date.now(),
+        accessCount: this.state.session.accessCount + 1,
+      };
+    } else if (decision.chosenExemption?.article === 'RTS Art. 16') {
       this.state.lowValueCounters = {
         amountEur: this.state.lowValueCounters.amountEur + amountEur,
         count: this.state.lowValueCounters.count + 1,
       };
     }
+
     this.#save();
     return entry;
+  }
+
+  #record(subject, meta) {
+    this.state.seq += 1;
+    const entry = {
+      sequence: this.state.seq,
+      executedAt: nowIso(),
+      kind: subject.type,
+      subject,
+      transaction: subject,
+      ...meta,
+    };
+    this.state.ledger.unshift(entry);
+    return entry;
+  }
+
+  get session() {
+    return this.state.session;
+  }
+
+  get beneficiaries() {
+    return Object.values(this.state.beneficiaries);
+  }
+
+  /** Simulated ageing of the last SCA, so the Art. 10 window is demonstrable. */
+  ageLastSca(days) {
+    if (!this.state.session.lastScaAt) return;
+    this.state.session.lastScaAt -= days * 86_400_000;
+    this.#save();
   }
 
   get ledger() {

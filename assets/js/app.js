@@ -1,6 +1,9 @@
 /**
- * UI orchestration: wires the form, the exemption engine, the WebAuthn client
- * and the simulated PSP together, and renders the evidence at every step.
+ * UI orchestration for the three actions a payments portal asks a customer to
+ * authorise: signing in, adding a beneficiary, and initiating a credit
+ * transfer. Each one is a different regulatory question wearing the same
+ * WebAuthn plumbing, so the flow below is shared and the differences live in
+ * the SCENARIOS table.
  */
 
 import {
@@ -14,10 +17,15 @@ import {
   toHex,
 } from './util.js';
 import { BankServer, STATUS, diffTransactions } from './bank-server.js';
-import { assess, summarise, toEurEquivalent, THRESHOLDS } from './sca-engine.js';
+import {
+  ACCESS_EXEMPTION_DAYS,
+  THRESHOLDS,
+  assessAccess,
+  assessBeneficiary,
+  assessPayment,
+} from './sca-engine.js';
 import {
   authorisePlain,
-  authoriseWithSpc,
   createPasskey,
   friendlyWebauthnError,
   probeEnvironment,
@@ -32,15 +40,20 @@ const auditLog = [];
 let env = null;
 let server = null;
 
-/** Everything about the payment currently in flight. */
 const flow = {
-  transaction: null,
+  scenario: 'login',
+  subject: null,
   decision: null,
   challenge: null,
   displayedAt: null,
   lastAssertion: null,
   lastPayload: null,
-  lastMethod: null,
+};
+
+const VOP_LABELS = {
+  MATCH: { text: 'Name matches', tone: 'good' },
+  CLOSE_MATCH: { text: 'Close match — review', tone: 'warn' },
+  NO_MATCH: { text: 'No match — high risk', tone: 'bad' },
 };
 
 // ------------------------------------------------------------------ logging
@@ -55,26 +68,230 @@ function log(level, message, data) {
     data ? `<br><span style="color:var(--ink-3)">${esc(typeof data === 'string' ? data : canonicalJson(data))}</span>` : ''
   }</span>`;
   list.append(li);
-  list.parentElement.scrollTop = list.parentElement.scrollHeight;
   list.scrollTop = list.scrollHeight;
 }
 
-// -------------------------------------------------------------- environment
+// ---------------------------------------------------------------- scenarios
 
-function renderEnvBadges() {
-  const items = [
-    { ok: env.secureContext, label: `secure context: ${env.secureContext ? 'yes' : 'no'}` },
-    { ok: true, label: `rpId: ${env.rpId}`, neutral: true },
-    { ok: env.webauthn, label: `WebAuthn: ${env.webauthn ? 'available' : 'missing'}` },
-    { ok: env.platformAuthenticator, label: `platform authenticator: ${env.platformAuthenticator ? 'yes' : 'no'}`, warnIfNo: true },
-    { ok: env.spc, label: `Secure Payment Confirmation: ${env.spc ? 'yes' : 'no'}`, warnIfNo: true },
-  ];
-  $('env-badges').innerHTML = items
-    .map((item) => {
-      const cls = item.neutral ? '' : item.ok ? 'ok' : item.warnIfNo ? 'warn' : 'no';
-      return `<li class="${cls}">${esc(item.label)}</li>`;
-    })
-    .join('');
+const SCENARIOS = {
+  login: {
+    formId: 'form-login',
+    subtitle: 'Accessing the portal. SCA is in scope under PSD2 Art. 97(1)(a); RTS Art. 10 may exempt it.',
+    // A sign-in has no amount and no payee, so there is nothing to bind.
+    bind: false,
+    exemptAction: 'Resume the session without SCA',
+    tampering: null,
+    readSubject() {
+      return {
+        schema: 'sca-rts-demo/access/1',
+        type: 'login',
+        subjectId: `SESS-${b64uEncode(crypto.getRandomValues(new Uint8Array(6)))}`,
+        user: server.user.name,
+        scope: $('f-scope').value,
+        channel: 'web-portal',
+        requestedAt: nowIso(),
+      };
+    },
+    assess(subject) {
+      return assessAccess({
+        firstAccess: server.session.accessCount === 0,
+        lastScaAt: server.session.lastScaAt,
+        scope: subject.scope,
+      });
+    },
+    confirmPanel(subject) {
+      return `
+        <span class="eyebrow">Confirm sign-in</span>
+        <div>
+          <div class="payee">${esc(server.user.displayName)}</div>
+          <p class="to">${esc(subject.user)}</p>
+        </div>
+        <div class="meta">
+          <span>${subject.scope === 'full-portal' ? 'Full portal access' : 'Read-only access'}</span>
+          <span>${esc(subject.subjectId)}</span>
+        </div>
+        <p class="foot">There is no amount or payee to display here, so RTS Art. 5(1)(a) has nothing to bite on. What protects this step is the challenge being unpredictable, single-use and — the property SMS codes lack — bound to this origin.</p>`;
+    },
+    describe: (subject) => ({
+      headline: 'Signed in',
+      detail: subject.scope === 'full-portal' ? 'Full portal access' : 'Read-only access',
+    }),
+    success: () => 'The session is established, and the Article 10 window has been restarted from this authentication.',
+  },
+
+  beneficiary: {
+    formId: 'form-beneficiary',
+    subtitle: 'Adding a payee. SCA is in scope under PSD2 Art. 97(1)(c), and under RTS Art. 13(1) for the trusted list.',
+    bind: true,
+    exemptAction: null,
+    tampering: (subject) => [
+      { value: 'none', label: 'No tampering — honest submission' },
+      { value: 'iban', label: 'Swap the IBAN after authorisation (the classic attack)' },
+      { value: 'name', label: 'Change the beneficiary name' },
+      // Only meaningful when there is a warning to suppress.
+      ...(subject.vop.outcome === 'MATCH'
+        ? []
+        : [{ value: 'vop', label: 'Rewrite the Verification of Payee result to “match”' }]),
+    ],
+    readSubject() {
+      const vop = $('b-vop').value;
+      return {
+        schema: 'sca-rts-demo/beneficiary/1',
+        type: 'beneficiary',
+        beneficiaryId: `BEN-${b64uEncode(crypto.getRandomValues(new Uint8Array(6)))}`,
+        name: $('b-name').value.trim(),
+        iban: $('b-iban').value.trim().toUpperCase(),
+        country: $('b-country').value.trim().toUpperCase(),
+        trusted: $('b-trusted').checked,
+        vop: { outcome: vop, checkedAt: nowIso() },
+        requestedAt: nowIso(),
+      };
+    },
+    assess(subject) {
+      return assessBeneficiary({ trusted: subject.trusted });
+    },
+    confirmPanel(subject) {
+      const vop = VOP_LABELS[subject.vop.outcome];
+      return `
+        <span class="eyebrow">Confirm new beneficiary</span>
+        <div>
+          <div class="payee">${esc(subject.name)}</div>
+          <p class="to">${esc(subject.iban)}</p>
+        </div>
+        <div class="chips">
+          <span class="chip ${vop.tone === 'good' ? 'good' : vop.tone === 'warn' ? 'warn' : 'bad'}">Verification of Payee: ${esc(vop.text)}</span>
+          <span class="chip">${esc(subject.country)}</span>
+          ${subject.trusted ? '<span class="chip warn">Trusted beneficiary list</span>' : ''}
+        </div>
+        ${
+          subject.vop.outcome !== 'MATCH'
+            ? `<p class="foot warn-foot">The account name does not match the beneficiary name. Under Regulation (EU) 2024/886 the customer must be warned and may still proceed — so bind that warning into what they sign, and keep it as evidence of what they were shown.</p>`
+            : ''
+        }
+        <p class="foot">Article 5 does not reach a non-payment action, but the name, IBAN and match result are committed to the challenge regardless. Change any of them after this point and the authorisation dies.</p>`;
+    },
+    applyTampering(subject, mode) {
+      const clone = structuredClone(subject);
+      if (mode === 'iban') clone.iban = 'LT601010012345678901';
+      if (mode === 'name') clone.name = 'Acme Manufacturing Holdings Ltd';
+      if (mode === 'vop') clone.vop = { ...clone.vop, outcome: 'MATCH' };
+      return clone;
+    },
+    describe: (subject) => ({
+      headline: `Beneficiary added — ${subject.name}`,
+      detail: `${subject.iban} · VoP ${subject.vop.outcome}${subject.trusted ? ' · trusted' : ''}`,
+    }),
+    success: (subject) =>
+      `${subject.name} was added with the IBAN and match result the customer actually saw${
+        subject.trusted ? ', and placed on the trusted-beneficiary list — payments to it may now qualify for the Art. 13 exemption' : ''
+      }.`,
+  },
+
+  payment: {
+    formId: 'form-payment',
+    subtitle: 'Initiating a credit transfer. SCA is in scope under PSD2 Art. 97(1)(b), with the Art. 13–18 exemptions in play.',
+    bind: true,
+    exemptAction: 'Execute without SCA (use the exemption)',
+    tampering: [
+      { value: 'none', label: 'No tampering — honest submission' },
+      { value: 'amount', label: 'Change the amount (×100)' },
+      { value: 'payee', label: 'Redirect to a different payee and IBAN' },
+      { value: 'both', label: 'Change both amount and payee' },
+      { value: 'reference', label: 'Change only the reference (not amount or payee)' },
+    ],
+    readSubject() {
+      return {
+        schema: 'sca-rts-demo/payment/1',
+        type: 'payment',
+        txnId: `TX-${b64uEncode(crypto.getRandomValues(new Uint8Array(6)))}`,
+        amount: normaliseAmount($('f-amount').value),
+        currency: $('f-currency').value,
+        payee: { name: $('f-payee').value.trim(), iban: $('f-iban').value.trim().toUpperCase() },
+        debtorAccount: 'IE64IRCE92050112345678',
+        reference: $('f-reference').value.trim(),
+        initiatedAt: nowIso(),
+        channel: 'web-remote',
+      };
+    },
+    assess(subject) {
+      const selected = server.beneficiaries.find((b) => b.beneficiaryId === $('f-payee-select').value);
+      return assessPayment(subject, {
+        // Trusted status is earned in the beneficiary flow, not asserted here.
+        trustedBeneficiary: Boolean(selected?.trusted),
+        recurringMandate: $('c-recurring').checked,
+        firstOfSeries: $('c-first').checked,
+        sameOwnerSamePsp: $('c-self').checked,
+        corporateProcess: $('c-corporate').checked,
+        forceSca: $('c-force').checked,
+        riskScore: Number($('f-risk').value),
+        riskThreshold: 40,
+        fraudRate: Number($('f-fraud').value),
+        lowValueCounters: server.lowValueCounters,
+      });
+    },
+    confirmPanel(subject) {
+      return `
+        <span class="eyebrow">Confirm this payment</span>
+        <div>
+          <div class="amount">${esc(formatMoney(subject.amount, subject.currency))}</div>
+          <p class="to">to</p>
+          <div class="payee">${esc(subject.payee.name)}</div>
+        </div>
+        <div class="meta">
+          <span>${esc(subject.payee.iban)}</span>
+          ${subject.reference ? `<span>ref ${esc(subject.reference)}</span>` : ''}
+          <span>${esc(subject.txnId)}</span>
+        </div>
+        <p class="foot">Article 5(1)(a): the payer must be made aware of the amount and the payee before authenticating. Displayed at ${esc(
+          flow.displayedAt,
+        )} and recorded in the audit trail.</p>`;
+    },
+    applyTampering(subject, mode) {
+      const clone = structuredClone(subject);
+      if (mode === 'amount' || mode === 'both') clone.amount = normaliseAmount(Number(subject.amount) * 100);
+      if (mode === 'payee' || mode === 'both') clone.payee = { name: 'Quick Cash Holdings Ltd', iban: 'LT601010012345678901' };
+      if (mode === 'reference') clone.reference = 'ORDER-0001';
+      return clone;
+    },
+    describe: (subject) => ({
+      headline: formatMoney(subject.amount, subject.currency),
+      detail: subject.payee.name,
+    }),
+    success: (subject) =>
+      `The transaction credited to ${subject.payee.name} for ${formatMoney(
+        subject.amount,
+        subject.currency,
+      )} is byte-for-byte the one the payer saw and signed.`,
+  },
+};
+
+const current = () => SCENARIOS[flow.scenario];
+
+function setScenario(name) {
+  flow.scenario = name;
+  flow.subject = null;
+  flow.decision = null;
+  flow.challenge = null;
+  flow.lastAssertion = null;
+
+  for (const button of document.querySelectorAll('#scenarios .scenario')) {
+    button.setAttribute('aria-pressed', String(button.dataset.scenario === name));
+  }
+  for (const [key, scenario] of Object.entries(SCENARIOS)) {
+    $(scenario.formId).hidden = key !== name;
+  }
+  $('subject-sub').textContent = SCENARIOS[name].subtitle;
+
+  resetSection('step-sca', 'sca-body', 'Submit an action above to see the assessment.');
+  resetSection('step-link', 'link-body', 'Waiting for an SCA decision.');
+  resetSection('step-auth', 'auth-body', 'Waiting for a challenge.');
+  resetSection('step-verify', 'verify-body', 'No authorisation attempted yet.');
+  if (name === 'payment') renderPayeeOptions();
+}
+
+function resetSection(sectionId, bodyId, placeholder) {
+  $(sectionId).classList.add('is-idle');
+  $(bodyId).innerHTML = `<p class="placeholder">${esc(placeholder)}</p>`;
 }
 
 // ----------------------------------------------------------------- step 1
@@ -94,7 +311,6 @@ function renderCredentials() {
         `<span class="chip">${esc(c.algLabel)}</span>`,
         c.transports?.length ? `<span class="chip">${esc(c.transports.join(', '))}</span>` : '',
         c.residentKey ? '<span class="chip good">discoverable</span>' : '',
-        c.paymentCapable ? '<span class="chip good">SPC-enabled</span>' : '',
         c.backupEligible
           ? `<span class="chip warn">BE=1 BS=${c.backupState ? 1 : 0} (synced)</span>`
           : '<span class="chip">device-bound</span>',
@@ -117,7 +333,7 @@ function renderCredentials() {
   list.querySelectorAll('[data-remove]').forEach((btn) => {
     btn.addEventListener('click', () => {
       server.removeCredential(btn.dataset.remove);
-      log('warn', 'Credential removed from the PSP registry');
+      log('warn', 'Credential removed from the registry — in a real portal this is the offboarding path, and it must also close active sessions');
       renderCredentials();
       refreshGates();
     });
@@ -129,7 +345,7 @@ function renderCredentials() {
  *
  * A browser that will not accept one of the optional parts of the request
  * throws NotSupportedError before any prompt is shown, so stepping down costs
- * the payer nothing — and the step that succeeds tells us exactly what their
+ * the customer nothing — and the step that succeeds tells us exactly what their
  * stack supports. The SPC `payment` extension is the usual culprit: the Secure
  * Payment Confirmation specification requires create() to throw
  * NotSupportedError on a user agent with no SPC implementation, which would
@@ -180,12 +396,9 @@ async function onRegister() {
     }
 
     if (!credential) throw lastError ?? new Error('No registration variant was accepted.');
-    if (accepted.tuning.payment !== true) {
-      log('info', `Enrolled without the SPC payment extension (${accepted.note}); this credential will use plain WebAuthn with the page-rendered confirmation.`);
-    }
 
     const result = await server.finishRegistration(credential);
-    $('reg-result').innerHTML = renderChecklist(result.checks.map((c) => ({ ...c, status: c.status })));
+    $('reg-result').innerHTML = renderChecklist(result.checks);
     if (result.ok) {
       log('good', `Passkey enrolled (${result.record.algLabel}) via ${result.record.keySource}`);
       if (result.record.backupEligible) {
@@ -216,75 +429,75 @@ async function onRegister() {
 
 // ----------------------------------------------------------------- step 2
 
-function readTransaction() {
-  const amount = normaliseAmount($('f-amount').value);
-  return {
-    schema: 'sca-rts-demo/transaction/1',
-    txnId: `TX-${b64uEncode(crypto.getRandomValues(new Uint8Array(6)))}`,
-    amount,
-    currency: $('f-currency').value,
-    payee: { name: $('f-payee').value.trim(), iban: $('f-iban').value.trim().toUpperCase() },
-    debtorAccount: 'IE64IRCE92050112345678',
-    reference: $('f-reference').value.trim(),
-    initiatedAt: nowIso(),
-    channel: 'web-remote',
-  };
+function renderPayeeOptions() {
+  const select = $('f-payee-select');
+  const saved = server.beneficiaries;
+  const previous = select.value;
+  select.innerHTML = [
+    '<option value="">New payee — entered by hand</option>',
+    ...saved.map(
+      (b) =>
+        `<option value="${esc(b.beneficiaryId)}">${esc(b.name)} · ${esc(b.iban.slice(0, 8))}…${
+          b.trusted ? ' · trusted' : ''
+        }</option>`,
+    ),
+  ].join('');
+  select.value = saved.some((b) => b.beneficiaryId === previous) ? previous : '';
+  applyPayeeSelection();
 }
 
-function readContext() {
-  return {
-    trustedBeneficiary: $('c-trusted').checked,
-    recurringMandate: $('c-recurring').checked,
-    firstOfSeries: $('c-first').checked,
-    sameOwnerSamePsp: $('c-self').checked,
-    corporateProcess: $('c-corporate').checked,
-    forceSca: $('c-force').checked,
-    riskScore: Number($('f-risk').value),
-    riskThreshold: 40,
-    fraudRate: Number($('f-fraud').value),
-    lowValueCounters: server.lowValueCounters,
-  };
+function applyPayeeSelection() {
+  const selected = server.beneficiaries.find((b) => b.beneficiaryId === $('f-payee-select').value);
+  const name = $('f-payee');
+  const iban = $('f-iban');
+  if (selected) {
+    name.value = selected.name;
+    iban.value = selected.iban;
+    name.readOnly = true;
+    iban.readOnly = true;
+  } else {
+    name.readOnly = false;
+    iban.readOnly = false;
+  }
 }
 
-function onAssess(event) {
-  event?.preventDefault();
-  const transaction = readTransaction();
-  const context = readContext();
-  const decision = assess(transaction, context);
+function onSubmit(event) {
+  event.preventDefault();
+  const scenario = current();
+  const subject = scenario.readSubject();
+  const decision = scenario.assess(subject);
 
-  flow.transaction = transaction;
+  flow.subject = subject;
   flow.decision = decision;
   flow.challenge = null;
   flow.lastAssertion = null;
 
-  log('step', `POST /payments → ${formatMoney(transaction.amount, transaction.currency)} to ${transaction.payee.name}`);
-  log(decision.scaRequired ? 'info' : 'warn', summarise(decision));
+  const described = scenario.describe(subject);
+  log('step', `POST /actions/${subject.type} → ${described.headline}${described.detail ? ` · ${described.detail}` : ''}`);
+  log(decision.scaRequired ? 'info' : 'warn', decision.summary);
 
-  renderScaDecision(decision, transaction);
+  renderDecision(decision, subject);
   resetSection('step-link', 'link-body', 'Waiting for an SCA decision.');
-  resetSection('step-auth', 'auth-body', 'Waiting for a dynamically linked challenge.');
+  resetSection('step-auth', 'auth-body', 'Waiting for a challenge.');
   resetSection('step-verify', 'verify-body', 'No authorisation attempted yet.');
   $('step-sca').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
 
-function resetSection(sectionId, bodyId, placeholder) {
-  $(sectionId).classList.add('is-idle');
-  $(bodyId).innerHTML = `<p class="placeholder">${esc(placeholder)}</p>`;
-}
-
 // ----------------------------------------------------------------- step 3
 
-function renderScaDecision(decision, transaction) {
-  const section = $('step-sca');
-  section.classList.remove('is-idle');
+function renderDecision(decision, subject) {
+  $('step-sca').classList.remove('is-idle');
+  const scenario = current();
 
   const verdictClass = decision.scaRequired ? 'sca' : 'exempt';
   const icon = decision.scaRequired ? '🔐' : '⚡';
-  const fx = decision.indicativeFx
-    ? `<p class="hint">Assessed as €${decision.amountEur.toFixed(2)} equivalent${
-        decision.unknownRate ? ' (no rate on file — treated 1:1)' : ' at an indicative demo rate'
-      }; RTS thresholds are expressed in euro.</p>`
-    : '';
+
+  const fx =
+    decision.indicativeFx
+      ? `<p class="hint">Assessed as €${decision.amountEur.toFixed(2)} equivalent${
+          decision.unknownRate ? ' (no rate on file — treated 1:1)' : ' at an indicative demo rate'
+        }; RTS thresholds are expressed in euro.</p>`
+      : '';
 
   const rows = decision.candidates
     .map(
@@ -297,200 +510,163 @@ function renderScaDecision(decision, transaction) {
     .join('');
 
   const actions = decision.scaRequired
-    ? `<button type="button" class="btn primary" id="btn-proceed-sca">Generate dynamically linked challenge</button>`
+    ? '<button type="button" class="btn primary" id="btn-proceed-sca">Generate challenge and authenticate</button>'
     : `<div class="row">
-         <button type="button" class="btn" id="btn-execute-exempt">Execute without SCA (use the exemption)</button>
+         <button type="button" class="btn" id="btn-execute-exempt">${esc(scenario.exemptAction)}</button>
          <button type="button" class="btn primary" id="btn-proceed-sca">Authenticate anyway</button>
        </div>
-       <p class="hint">A PSP may always choose to authenticate. The payee’s PSP can also refuse an exemption and send the transaction back for SCA.</p>`;
+       <p class="hint">A PSP may always choose to authenticate. For payments, the payee’s PSP can also refuse an exemption and send the transaction back for SCA.</p>`;
 
   $('sca-body').innerHTML = `
     <div class="verdict ${verdictClass}">
       <span class="icon">${icon}</span>
       <div>
         <h3>${decision.scaRequired ? 'Strong customer authentication required' : 'Exemption available'}</h3>
-        <p>${esc(summarise(decision))}</p>
+        <p>${esc(decision.summary)}</p>
       </div>
+    </div>
+    <div class="basis">
+      <span class="basis-art">${esc(decision.basis.article)}</span>
+      <span>${esc(decision.basis.text)}</span>
     </div>
     ${fx}
     <ul class="exemptions">${rows}</ul>
     ${actions}`;
 
-  $('btn-proceed-sca')?.addEventListener('click', () => beginAuthorisation(transaction, decision));
-  $('btn-execute-exempt')?.addEventListener('click', () => executeExempt(transaction, decision));
+  $('btn-proceed-sca')?.addEventListener('click', () => beginAuthorisation(subject, decision));
+  $('btn-execute-exempt')?.addEventListener('click', () => executeExempt(subject, decision));
 }
 
-function executeExempt(transaction, decision) {
-  const entry = server.executeExempt(transaction, decision, decision.amountEur);
-  log('warn', `Executed without SCA under ${decision.chosenExemption.article} — ${decision.chosenExemption.name}`, {
-    txnId: transaction.txnId,
+function executeExempt(subject, decision) {
+  const entry = server.applyExempt(subject, decision, decision.amountEur ?? 0);
+  log('warn', `Carried out without SCA under ${decision.chosenExemption.article} — ${decision.chosenExemption.name}`, {
+    subjectId: subject.subjectId ?? subject.txnId,
   });
+  renderPortalState();
   renderCounters();
   renderLedger();
   $('sca-body').insertAdjacentHTML(
     'beforeend',
-    `<div class="verdict exempt"><span class="icon">✓</span><div><h3>Payment #${entry.sequence} executed under an exemption</h3><p>No authentication code was generated, so Article 5 dynamic linking did not apply to this payment. The Article 16 counters on the right have moved.</p></div></div>`,
+    `<div class="verdict exempt"><span class="icon">✓</span><div><h3>Action #${entry.sequence} completed under an exemption</h3><p>No authentication code was generated, so Article 5 dynamic linking did not apply. ${
+      subject.type === 'login'
+        ? 'Note that an exempted access does not restart the Article 10 window — that runs from the last actual SCA.'
+        : 'The Article 16 counters on the right have moved.'
+    }</p></div></div>`,
   );
 }
 
 // ----------------------------------------------------------------- step 4
 
-async function beginAuthorisation(transaction, decision) {
-  const challenge = await server.createAuthorisationChallenge(transaction, { scaDecision: decision });
+async function beginAuthorisation(subject, decision) {
+  const scenario = current();
+  const challenge = await server.createAuthorisationChallenge(subject, { scaDecision: decision, bind: scenario.bind });
   flow.challenge = challenge;
   flow.displayedAt = nowIso();
 
-  log('step', 'POST /payments/{id}/sca/begin → challenge = SHA-256(nonce ‖ canonical-JSON(transaction))', {
-    challenge: challenge.challenge,
-  });
+  log(
+    'step',
+    scenario.bind
+      ? 'POST /sca/begin → challenge = SHA-256(nonce ‖ canonical-JSON(action))'
+      : 'POST /sca/begin → challenge = 32 random bytes (nothing to bind)',
+    { challenge: challenge.challenge },
+  );
 
-  renderLinking(transaction, challenge);
-  renderAuthorise(transaction, challenge);
+  renderBinding(subject, challenge);
+  renderAuthorise(subject, challenge);
   $('step-link').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
-function renderLinking(transaction, challenge) {
+function renderBinding(subject, challenge) {
+  const scenario = current();
   $('step-link').classList.remove('is-idle');
+
+  const derivation = challenge.canonical
+    ? `<div class="stack">
+         <div class="label-row"><h3>Canonical action</h3><span class="tag">${challenge.canonical.length} bytes hashed</span></div>
+         <pre class="codeblock wrap-any">${esc(challenge.canonical)}</pre>
+       </div>
+       <div class="stack">
+         <div class="label-row"><h3>Challenge derivation</h3><span class="tag">server-side only</span></div>
+         <dl class="kv">
+           <dt>nonce (32 B)</dt><dd>${esc(toHex(b64uDecode(challenge.nonce), { groupsOf: 4 }))}</dd>
+           <dt>challenge</dt><dd>${esc(challenge.challenge)}</dd>
+           <dt>SHA-256 hex</dt><dd>${esc(toHex(b64uDecode(challenge.challenge), { groupsOf: 4 }))}</dd>
+           <dt>expires</dt><dd>${esc(new Date(challenge.expiresAt).toISOString())}</dd>
+         </dl>
+         <p class="hint">The nonce and the authoritative record stay on the server. The browser only ever sees the 32-byte challenge — which is exactly why the server has to re-hash at verification time rather than trust what comes back.</p>
+       </div>`
+    : `<div class="stack">
+         <div class="label-row"><h3>Challenge</h3><span class="tag">unbound — 32 random bytes</span></div>
+         <dl class="kv">
+           <dt>challenge</dt><dd>${esc(challenge.challenge)}</dd>
+           <dt>expires</dt><dd>${esc(new Date(challenge.expiresAt).toISOString())}</dd>
+         </dl>
+         <p class="hint">No commitment is computed because a sign-in has no amount or payee. The scope of the session is decided by the server from its own records — never from anything the client submits — so there is nothing for an attacker to rewrite in transit.</p>
+       </div>`;
+
   $('link-body').innerHTML = `
-    <div class="confirm" id="confirm-panel">
-      <span class="eyebrow">Confirm this payment</span>
-      <div>
-        <div class="amount">${esc(formatMoney(transaction.amount, transaction.currency))}</div>
-        <p class="to">to</p>
-        <div class="payee">${esc(transaction.payee.name)}</div>
-      </div>
-      <div class="meta">
-        <span>${esc(transaction.payee.iban)}</span>
-        ${transaction.reference ? `<span>ref ${esc(transaction.reference)}</span>` : ''}
-        <span>${esc(transaction.txnId)}</span>
-      </div>
-      <p class="foot">Article 5(1)(a): the payer must be made aware of the amount and the payee before authenticating. Displayed at ${esc(
-        flow.displayedAt,
-      )} and recorded in the audit trail.</p>
-    </div>
-
-    <div class="stack">
-      <div class="label-row"><h3>Canonical transaction</h3><span class="tag">${challenge.canonical.length} bytes hashed</span></div>
-      <pre class="codeblock wrap-any">${esc(challenge.canonical)}</pre>
-    </div>
-
-    <div class="stack">
-      <div class="label-row"><h3>Challenge derivation</h3><span class="tag">server-side only</span></div>
-      <dl class="kv">
-        <dt>nonce (32 B)</dt><dd>${esc(toHex(b64uDecode(challenge.nonce), { groupsOf: 4 }))}</dd>
-        <dt>challenge</dt><dd>${esc(challenge.challenge)}</dd>
-        <dt>SHA-256 hex</dt><dd>${esc(toHex(b64uDecode(challenge.challenge), { groupsOf: 4 }))}</dd>
-        <dt>expires</dt><dd>${esc(new Date(challenge.expiresAt).toISOString())}</dd>
-      </dl>
-      <p class="hint">The nonce and the authoritative transaction stay on the server. The browser only ever sees the 32-byte challenge — which is exactly why the server has to re-hash at verification time rather than trust what comes back.</p>
-    </div>`;
+    <div class="confirm" id="confirm-panel">${scenario.confirmPanel(subject)}</div>
+    ${derivation}`;
 }
 
 // ----------------------------------------------------------------- step 5
 
-function renderAuthorise(transaction, challenge) {
+function renderAuthorise(subject, challenge) {
+  const scenario = current();
   $('step-auth').classList.remove('is-idle');
-  const spcNote = env.spc
-    ? 'Secure Payment Confirmation is available here: the browser will render the amount and payee itself and sign them into clientDataJSON.'
-    : 'Secure Payment Confirmation is not available in this browser, so the page-rendered panel above is the Article 5(1)(a) confirmation. The challenge binding is identical either way.';
+
+  const modes = typeof scenario.tampering === 'function' ? scenario.tampering(subject) : scenario.tampering;
+  const attack = modes
+    ? `<div class="attack">
+         <h3>Attacker simulation</h3>
+         <p>Tamper with the action <em>after</em> the customer authorised it — the manipulated payload is what gets submitted, while the signature still covers the original challenge.</p>
+         <select id="tamper-mode" aria-label="Tampering to apply after authorisation">
+           ${modes.map((t) => `<option value="${esc(t.value)}">${esc(t.label)}</option>`).join('')}
+         </select>
+       </div>`
+    : `<div class="attack">
+         <h3>Nothing to tamper with</h3>
+         <p>An unbound challenge cannot detect a rewritten payload — there is no commitment to compare against. For a sign-in that is fine, because the server decides the session’s scope from its own records rather than from the request. The moment an action carries an amount or a payee, that stops being true and binding becomes necessary.</p>
+       </div>`;
 
   $('auth-body').innerHTML = `
-    <p class="hint">${esc(spcNote)}</p>
-    <div class="attack">
-      <h3>Attacker simulation</h3>
-      <p>Tamper with the transaction <em>after</em> the payer authorised it — the manipulated payload is what gets submitted for execution, while the signature still covers the original challenge.</p>
-      <select id="tamper-mode" aria-label="Tampering to apply after authorisation">
-        <option value="none">No tampering — honest submission</option>
-        <option value="amount">Change the amount (×100)</option>
-        <option value="payee">Redirect to a different payee and IBAN</option>
-        <option value="both">Change both amount and payee</option>
-        <option value="reference">Change only the reference (not amount or payee)</option>
-      </select>
-    </div>
+    ${attack}
     <div class="row">
-      ${env.spc ? '<button type="button" class="btn primary" id="btn-auth-spc">Authorise with Secure Payment Confirmation</button>' : ''}
-      <button type="button" class="btn ${env.spc ? '' : 'primary'}" id="btn-auth-plain">Authorise with passkey</button>
+      <button type="button" class="btn primary" id="btn-auth-plain">Authorise with passkey</button>
       <button type="button" class="btn ghost" id="btn-replay" disabled>Replay the last authorisation</button>
-    </div>`;
+    </div>
+    <p class="hint">Compare with an SMS code: it would be equally valid typed into a lookalike domain, read out over the phone, or intercepted after a SIM swap. This assertion is useless anywhere but ${esc(env.origin)}.</p>`;
 
-  $('btn-auth-spc')?.addEventListener('click', () => authorise('spc', transaction, challenge));
-  $('btn-auth-plain').addEventListener('click', () => authorise('plain', transaction, challenge));
+  $('btn-auth-plain').addEventListener('click', () => authorise(subject, challenge));
   $('btn-replay').addEventListener('click', () => replay());
   refreshGates();
 }
 
-function applyTampering(transaction, mode) {
-  const clone = structuredClone(transaction);
-  if (mode === 'amount' || mode === 'both') {
-    clone.amount = normaliseAmount(Number(transaction.amount) * 100);
-  }
-  if (mode === 'payee' || mode === 'both') {
-    clone.payee = { name: 'Quick Cash Holdings Ltd', iban: 'LT601010012345678901' };
-  }
-  if (mode === 'reference') {
-    clone.reference = 'ORDER-0001';
-  }
-  return clone;
-}
-
-async function authorise(method, transaction, challenge) {
-  const buttons = ['btn-auth-spc', 'btn-auth-plain'].map($).filter(Boolean);
-  buttons.forEach((b) => (b.disabled = true));
+async function authorise(subject, challenge) {
+  const scenario = current();
+  const button = $('btn-auth-plain');
+  button.disabled = true;
 
   try {
-    log('step', `navigator.credentials.get() via ${method === 'spc' ? 'Secure Payment Confirmation' : 'plain WebAuthn'} — userVerification: required`);
-
-    let assertion;
-    let usedMethod = method;
-    try {
-      if (method === 'spc') {
-        const result = await authoriseWithSpc({
-          challengeBytes: challenge.challengeBytes,
-          credentialIds: server.credentials.map((c) => b64uDecode(c.credentialId)),
-          rpId: challenge.rpId,
-          payeeName: transaction.payee.name,
-          amount: transaction.amount,
-          currency: transaction.currency,
-          instrumentLabel: 'Demo Bank current account ••4321',
-        });
-        assertion = result.assertion;
-      } else {
-        const result = await authorisePlain({
-          challengeBytes: challenge.challengeBytes,
-          allowCredentials: challenge.allowCredentials,
-          rpId: challenge.rpId,
-          timeout: challenge.timeout,
-        });
-        assertion = result.assertion;
-      }
-    } catch (error) {
-      if (method === 'spc') {
-        log('warn', `SPC path unavailable (${friendlyWebauthnError(error)}) — falling back to plain WebAuthn`);
-        const result = await authorisePlain({
-          challengeBytes: challenge.challengeBytes,
-          allowCredentials: challenge.allowCredentials,
-          rpId: challenge.rpId,
-          timeout: challenge.timeout,
-        });
-        assertion = result.assertion;
-        usedMethod = 'plain';
-      } else {
-        throw error;
-      }
-    }
+    log('step', 'navigator.credentials.get() — userVerification: required');
+    const { assertion } = await authorisePlain({
+      challengeBytes: challenge.challengeBytes,
+      allowCredentials: challenge.allowCredentials,
+      rpId: challenge.rpId,
+      timeout: challenge.timeout,
+    });
 
     const mode = $('tamper-mode')?.value ?? 'none';
-    const executionPayload = applyTampering(transaction, mode);
-    if (mode !== 'none') {
-      log('bad', `Attacker rewrote the payload after authorisation (${mode})`, diffTransactions(transaction, executionPayload));
+    const executionPayload = mode === 'none' || !scenario.applyTampering ? subject : scenario.applyTampering(subject, mode);
+    if (executionPayload !== subject) {
+      log('bad', `Attacker rewrote the payload after authorisation (${mode})`, diffTransactions(subject, executionPayload));
     }
 
     flow.lastAssertion = assertion;
     flow.lastPayload = executionPayload;
-    flow.lastMethod = usedMethod;
     $('btn-replay').disabled = false;
 
-    await verify(assertion, executionPayload, usedMethod);
+    await verify(assertion, executionPayload);
   } catch (error) {
     log('bad', `Authorisation failed — ${friendlyWebauthnError(error)}`);
     $('step-verify').classList.remove('is-idle');
@@ -498,30 +674,34 @@ async function authorise(method, transaction, challenge) {
       friendlyWebauthnError(error),
     )}</p></div></div>`;
   } finally {
-    buttons.forEach((b) => (b.disabled = false));
+    button.disabled = false;
   }
 }
 
 async function replay() {
   if (!flow.lastAssertion) return;
-  log('step', 'Replaying the previous assertion against the server — the challenge has already been consumed');
-  await verify(flow.lastAssertion, flow.lastPayload, flow.lastMethod, { replay: true });
+  log('step', 'Replaying the previous assertion — the challenge has already been consumed');
+  await verify(flow.lastAssertion, flow.lastPayload, { replay: true });
 }
 
 // ----------------------------------------------------------------- step 6
 
-async function verify(assertion, executionPayload, method, { replay = false } = {}) {
+async function verify(assertion, executionPayload, { replay = false } = {}) {
   const result = await server.verifyAuthorisation({ assertion, executionPayload });
-  renderVerification(result, executionPayload, method, replay);
+  renderVerification(result, executionPayload, replay);
 
   if (result.ok) {
-    log('good', `Authorisation accepted — payment #${result.receipt.sequence} executed`, { txnId: executionPayload.txnId });
+    log('good', `Authorisation accepted — action #${result.receipt.sequence} carried out`, {
+      type: executionPayload.type,
+    });
   } else {
     const failed = result.checks.filter((c) => c.status === STATUS.FAIL).map((c) => c.label);
     log('bad', `Authorisation rejected — ${failed.length} check(s) failed`, failed);
   }
+  renderPortalState();
   renderCounters();
   renderLedger();
+  if (flow.scenario === 'payment') renderPayeeOptions();
   $('step-verify').scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 
@@ -541,19 +721,20 @@ function renderChecklist(checks) {
     .join('')}</ul>`;
 }
 
-function renderVerification(result, executionPayload, method, replayed) {
+function renderVerification(result, executionPayload, replayed) {
   $('step-verify').classList.remove('is-idle');
+  const scenario = SCENARIOS[executionPayload.type === 'login' ? 'login' : executionPayload.type];
 
   const failedLinking = result.checks.find((c) => c.id === 'dynamic-linking' && c.status === STATUS.FAIL);
   const verdict = result.ok
-    ? `<div class="verdict ok"><span class="icon">✓</span><div><h3>Payment executed</h3><p>Every check passed. The transaction credited to ${esc(
-        executionPayload.payee.name,
-      )} for ${esc(formatMoney(executionPayload.amount, executionPayload.currency))} is byte-for-byte the one the payer saw and signed.</p></div></div>`
-    : `<div class="verdict fail"><span class="icon">✗</span><div><h3>Authorisation rejected — nothing executed</h3><p>${
+    ? `<div class="verdict ok"><span class="icon">✓</span><div><h3>${esc(
+        scenario.describe(executionPayload).headline,
+      )}</h3><p>${esc(scenario.success(executionPayload))}</p></div></div>`
+    : `<div class="verdict fail"><span class="icon">✗</span><div><h3>Authorisation rejected — nothing carried out</h3><p>${
         replayed
           ? 'The assertion is cryptographically valid, but its challenge was already consumed. An authentication code may not be reusable (Art. 4(3)(a)).'
           : failedLinking
-            ? 'The signature verifies, but the transaction submitted for execution does not re-hash to the challenge the payer signed. This is Article 5(1)(d) doing its job.'
+            ? 'The signature verifies, but what was submitted does not re-hash to the challenge the customer signed. This is the binding doing its job.'
             : 'One or more verification steps failed.'
       }</p></div></div>`;
 
@@ -577,7 +758,7 @@ function renderVerification(result, executionPayload, method, replayed) {
     ${hashes}
     ${renderChecklist(result.checks)}
     <div class="stack">
-      <div class="label-row"><h3>clientDataJSON (signed)</h3><span class="tag">${esc(method === 'spc' ? 'payment.get' : 'webauthn.get')}</span></div>
+      <div class="label-row"><h3>clientDataJSON (signed)</h3><span class="tag">${esc(result.clientData.type)}</span></div>
       <pre class="codeblock wrap-any">${esc(prettyJson(result.clientData))}</pre>
     </div>
     <div class="stack">
@@ -590,7 +771,7 @@ function renderVerification(result, executionPayload, method, replayed) {
       </dl>
     </div>
     <div class="stack">
-      <div class="label-row"><h3>Transaction submitted for execution</h3><span class="tag">what the server was asked to do</span></div>
+      <div class="label-row"><h3>Submitted for execution</h3><span class="tag">what the server was asked to do</span></div>
       <pre class="codeblock wrap-any">${esc(canonicalJson(executionPayload))}</pre>
     </div>
     <div class="row">
@@ -598,11 +779,39 @@ function renderVerification(result, executionPayload, method, replayed) {
     </div>`;
 
   $('btn-new-challenge').addEventListener('click', () => {
-    if (flow.transaction && flow.decision) beginAuthorisation(flow.transaction, flow.decision);
+    if (flow.subject && flow.decision) beginAuthorisation(flow.subject, flow.decision);
   });
 }
 
 // ------------------------------------------------------------------- rail
+
+function renderPortalState() {
+  const { session } = server;
+  const days = session.lastScaAt ? Math.floor((Date.now() - session.lastScaAt) / 86_400_000) : null;
+  const beneficiaries = server.beneficiaries;
+
+  $('portal-state').innerHTML = `
+    <dl class="kv">
+      <dt>Session</dt><dd>${session.signedInAt ? 'signed in' : 'not signed in'}</dd>
+      <dt>Last SCA</dt><dd>${days === null ? 'never' : `${days} day(s) ago`}</dd>
+      <dt>Art. 10 window</dt><dd>${
+        days === null ? 'not started' : days <= ACCESS_EXEMPTION_DAYS ? `${ACCESS_EXEMPTION_DAYS - days} day(s) left` : 'expired'
+      }</dd>
+      <dt>Accesses</dt><dd>${session.accessCount}</dd>
+    </dl>
+    ${
+      beneficiaries.length
+        ? `<div class="stack"><div class="label-row"><h3>Beneficiaries</h3></div>${beneficiaries
+            .map(
+              (b) =>
+                `<div class="ledger-item"><div class="top"><span class="amt">${esc(b.name)}</span>${
+                  b.trusted ? '<span class="chip warn">trusted</span>' : ''
+                }</div><span class="meta">${esc(b.iban)} · VoP ${esc(b.vop.outcome)}</span></div>`,
+            )
+            .join('')}</div>`
+        : '<p class="hint">No beneficiaries yet. Add one to unlock the Article 13 exemption in the payment flow.</p>'
+    }`;
+}
 
 function renderCounters() {
   const c = server.lowValueCounters;
@@ -623,20 +832,23 @@ function renderCounters() {
 function renderLedger() {
   const entries = server.ledger.slice(0, 8);
   if (!entries.length) {
-    $('ledger').innerHTML = '<p class="placeholder">Nothing executed yet.</p>';
+    $('ledger').innerHTML = '<p class="placeholder">Nothing yet.</p>';
     return;
   }
   $('ledger').innerHTML = entries
-    .map(
-      (e) => `<div class="ledger-item">
+    .map((e) => {
+      const described = SCENARIOS[e.kind].describe(e.subject);
+      return `<div class="ledger-item">
         <div class="top">
-          <span class="amt">${esc(formatMoney(e.transaction.amount, e.transaction.currency))}</span>
-          <span class="chip ${e.authenticated ? 'good' : 'warn'}">${e.authenticated ? 'SCA' : esc(e.exemption?.article ?? 'exempt')}</span>
+          <span class="amt">${esc(described.headline)}</span>
+          <span class="chip ${e.authenticated ? 'good' : 'warn'}">${
+            e.authenticated ? 'SCA' : esc(e.exemption?.article ?? 'exempt')
+          }</span>
         </div>
-        <span>${esc(e.transaction.payee.name)}</span>
+        <span>${esc(described.detail)}</span>
         <span class="meta">#${e.sequence} · ${esc(e.executedAt)}</span>
-      </div>`,
-    )
+      </div>`;
+    })
     .join('');
 }
 
@@ -649,11 +861,19 @@ function exportAudit() {
     environment: env,
     relyingParty: { rpId: server.rpId, origin: server.origin },
     credentials: server.credentials.map(({ jwk, ...rest }) => ({ ...rest, publicKeyJwk: jwk })),
+    session: server.session,
+    beneficiaries: server.beneficiaries,
     lowValueCounters: server.lowValueCounters,
-    currentTransaction: flow.transaction,
+    currentAction: flow.subject,
     scaDecision: flow.decision,
     challenge: flow.challenge
-      ? { challenge: flow.challenge.challenge, canonical: flow.challenge.canonical, issuedAt: flow.challenge.issuedAt, expiresAt: flow.challenge.expiresAt }
+      ? {
+          challenge: flow.challenge.challenge,
+          bound: flow.challenge.bound,
+          canonical: flow.challenge.canonical,
+          issuedAt: flow.challenge.issuedAt,
+          expiresAt: flow.challenge.expiresAt,
+        }
       : null,
     visualConfirmationDisplayedAt: flow.displayedAt,
     ledger: server.ledger,
@@ -673,37 +893,68 @@ function exportAudit() {
 
 function refreshGates() {
   const hasCredential = server.credentials.length > 0;
-  $('btn-assess').disabled = false;
-  $('register-hint').textContent = hasCredential ? '' : '';
-  document.querySelectorAll('#btn-auth-plain, #btn-auth-spc').forEach((b) => {
-    b.disabled = !hasCredential;
-    b.title = hasCredential ? '' : 'Enrol a passkey first (step 1).';
-  });
+  const button = $('btn-auth-plain');
+  if (button) {
+    button.disabled = !hasCredential;
+    button.title = hasCredential ? '' : 'Enrol a passkey first (step 1).';
+  }
 }
 
 // -------------------------------------------------------------------- init
+
+function renderEnvBadges() {
+  const items = [
+    { ok: env.secureContext, label: `secure context: ${env.secureContext ? 'yes' : 'no'}` },
+    { ok: true, label: `rpId: ${env.rpId}`, neutral: true },
+    { ok: env.webauthn, label: `WebAuthn: ${env.webauthn ? 'available' : 'missing'}` },
+    { ok: env.platformAuthenticator, label: `platform authenticator: ${env.platformAuthenticator ? 'yes' : 'no'}`, warnIfNo: true },
+    { ok: env.conditionalMediation, label: `passkey autofill: ${env.conditionalMediation ? 'yes' : 'no'}`, warnIfNo: true },
+  ];
+  $('env-badges').innerHTML = items
+    .map((item) => `<li class="${item.neutral ? '' : item.ok ? 'ok' : item.warnIfNo ? 'warn' : 'no'}">${esc(item.label)}</li>`)
+    .join('');
+}
+
+function resetDemo() {
+  server.reset();
+  renderCredentials();
+  renderPortalState();
+  renderCounters();
+  renderLedger();
+  setScenario(flow.scenario);
+  log('warn', 'Demo state reset');
+}
 
 async function init() {
   env = await probeEnvironment();
   server = new BankServer({
     rpId: env.rpId,
-    rpName: 'Demo Bank (PSD2 SCA reference)',
+    rpName: 'Demo Payments Portal (PSD2 SCA reference)',
     origin: env.origin,
     log,
   });
 
   renderEnvBadges();
   renderCredentials();
+  renderPortalState();
   renderCounters();
   renderLedger();
-  refreshGates();
+
+  $('access-window').textContent = String(ACCESS_EXEMPTION_DAYS);
+  $('login-name').textContent = server.user.displayName;
+  $('login-email').textContent = server.user.name;
 
   log('info', `Relying party ${env.rpId} · origin ${env.origin}`);
   if (!env.secureContext) log('bad', 'Not a secure context — WebAuthn will refuse to run. Use HTTPS or localhost.');
   if (!env.platformAuthenticator) log('warn', 'No platform authenticator detected; a security key or a phone via hybrid transport can still be used.');
-  if (!env.spc) log('info', 'Secure Payment Confirmation unavailable — the demo will use plain WebAuthn with a page-rendered confirmation.');
 
-  $('payment-form').addEventListener('submit', onAssess);
+  for (const button of document.querySelectorAll('#scenarios .scenario')) {
+    button.addEventListener('click', () => setScenario(button.dataset.scenario));
+  }
+  for (const scenario of Object.values(SCENARIOS)) {
+    $(scenario.formId).addEventListener('submit', onSubmit);
+  }
+
   $('btn-register').addEventListener('click', onRegister);
   $('btn-export').addEventListener('click', exportAudit);
   $('btn-clear-log').addEventListener('click', () => {
@@ -711,31 +962,30 @@ async function init() {
     $('audit-log').innerHTML = '';
   });
   $('btn-reset').addEventListener('click', () => {
-    if (!confirm('Forget enrolled passkeys, counters and the ledger held by this demo? Your device keeps its passkey — remove it in your password manager if you want it gone there too.')) return;
-    server.reset();
-    renderCredentials();
-    renderCounters();
-    renderLedger();
-    ['step-sca', 'step-link', 'step-auth', 'step-verify'].forEach((id) => $(id).classList.add('is-idle'));
-    resetSection('step-sca', 'sca-body', 'Submit a payment above to see the assessment.');
-    resetSection('step-link', 'link-body', 'Waiting for an SCA decision.');
-    resetSection('step-auth', 'auth-body', 'Waiting for a dynamically linked challenge.');
-    resetSection('step-verify', 'verify-body', 'No authorisation attempted yet.');
-    log('warn', 'Demo state reset');
+    if (!confirm('Forget enrolled passkeys, beneficiaries, counters and activity held by this demo? Your device keeps its passkey — remove it in your password manager if you want it gone there too.')) return;
+    resetDemo();
+  });
+  $('btn-age-sca').addEventListener('click', () => {
+    server.ageLastSca(200);
+    renderPortalState();
+    log('info', 'Simulated 200 days passing since the last SCA — the Article 10 window has now lapsed');
   });
   $('btn-preset-low').addEventListener('click', () => {
     $('f-amount').value = '12.00';
     $('f-currency').value = 'EUR';
-    $('payment-form').requestSubmit();
+    $('form-payment').requestSubmit();
   });
   $('f-risk').addEventListener('input', (e) => {
     $('out-risk').textContent = e.target.value;
   });
+  $('f-payee-select').addEventListener('change', applyPayeeSelection);
   const syncRecurring = () => {
     $('c-first').disabled = !$('c-recurring').checked;
   };
   $('c-recurring').addEventListener('change', syncRecurring);
   syncRecurring();
+
+  setScenario('login');
 }
 
 init().catch((error) => {

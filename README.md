@@ -1,22 +1,32 @@
-# Passkeys for PSD2 payments — dynamic linking & SCA exemptions
+# Passkeys in a payments portal — PSD2 SCA, dynamic linking and exemptions
 
-A working, static demo of what it actually takes to authorise a payment with a passkey under
-PSD2 and Commission Delegated Regulation (EU) 2018/389 (the RTS on strong customer
-authentication):
+A working demo of what replacing SMS codes with passkeys actually involves in a first-party
+payments portal, for the three things a customer authorises:
+
+| Action | SCA required by | Exemption | Dynamic linking |
+| --- | --- | --- | --- |
+| **Signing in** | PSD2 Art. 97(1)(a) | RTS Art. 10 — read-only scope, not first access, within 180 days of the last SCA | Not applicable: no amount, no payee |
+| **Adding a beneficiary** | PSD2 Art. 97(1)(c); RTS Art. 13(1) for the trusted list | None — the Art. 10–18 exemptions reach payment transactions and account access, not payee records | Not mandated, but worth doing: bind the name, IBAN and Verification of Payee result |
+| **Initiating a credit transfer** | PSD2 Art. 97(1)(b) | RTS Art. 13–18, subject to counters and audited fraud rates | Mandatory under RTS Art. 5 whenever SCA is applied |
+
+![The three scenarios](docs/screenshot-scenarios.png)
+
+Along the way it shows the parts that are easy to get wrong:
 
 - **Article 5 dynamic linking** — the authentication code is bound to the amount and the payee,
   and dies the moment either changes.
-- **Articles 10–18 exemptions** — an engine that evaluates every candidate exemption, including
-  the running counters that bring SCA back.
-- **Secure Payment Confirmation** — where the browser supports it, the amount and payee are
-  rendered by the browser and signed into `clientDataJSON`, so the visual confirmation becomes
-  cryptographic evidence rather than a promise the page makes.
-- **An attacker simulation** — rewrite the amount or the payee *after* the payer authorised, and
-  watch the signature stay valid while the payment is refused.
+- **An attacker simulation** — rewrite the amount, the payee or the beneficiary's IBAN *after* the
+  customer authorised, and watch the signature stay valid while the action is refused.
+- **The exemption engines** — live Article 16 counters, Article 18 TRA bands tied to reference
+  fraud rates, and the Article 10 access window that lapses.
+- **Verification of Payee** — the Regulation (EU) 2024/886 match result is bound into the
+  challenge, so the customer is cryptographically attesting to the warning they were shown.
 
-Everything runs in the browser, so it deploys to GitHub Pages as static files.
+Everything runs in the browser, so it deploys to GitHub Pages as static files. Because the portal
+is first-party — the relying party is its own origin — no Secure Payment Confirmation is involved
+and it works in every modern browser.
 
-![The visual confirmation and the challenge derivation](docs/screenshot-dynamic-linking.png)
+![Binding a beneficiary change](docs/screenshot-beneficiary-binding.png)
 
 ## Try it
 
@@ -36,19 +46,26 @@ A suggested run-through:
 
 1. **Create passkey** — note the flags the server records: `UV`, and `BE`/`BS` if your passkey is
    synced across devices.
-2. Leave the €150 payment as it is and **Assess SCA requirement**. At the default 0.13 % fraud
-   band the transaction risk analysis ceiling is €100, so SCA is required.
-3. **Generate dynamically linked challenge** — the canonical transaction, the nonce and the
-   resulting SHA-256 are all shown.
-4. Authorise with the passkey. Every server-side check is reported with the provision it serves.
-5. Now do it again with **Change the amount (×100)** selected. The signature still verifies; the
-   payment is refused. That gap is the entire point of Article 5.
+2. **Sign in.** The first access always needs SCA. Afterwards, switch the scope to read-only and
+   assess again: Article 10 now exempts it. Switch back to full portal access and it does not —
+   a session that can move money is never covered. Then press *Simulate 200 days passing* and
+   watch the window lapse.
+3. **Add a beneficiary.** No exemption exists for this, whatever the amount. Set the Verification
+   of Payee result to *No match* to see the warning bound into the challenge, then use the
+   attacker control to **swap the IBAN after authorisation**. The signature still verifies; the
+   beneficiary is refused. That is the attack that matters most in B2B payments, because a payee
+   record converts into every future payment.
+4. **Make a payment** to the beneficiary you just added. Because it was added to the trusted list
+   — which itself required SCA — Article 13 now exempts the payment. Tick *Apply SCA even if an
+   exemption is available* to override it.
+5. Pay a new payee €150 instead and authorise properly, then repeat with **Change the amount
+   (×100)**. Signature valid, payment refused: Article 5(1)(d) doing its job.
 6. **Replay the last authorisation** — rejected, because an authentication code may not be
    reusable (Art. 4(3)(a)).
 7. Try the **€12 low-value payment** repeatedly and watch the Article 16 counters fill up until
    SCA comes back.
 
-![A tampered amount rejected while the signature still verifies](docs/screenshot-tamper-rejected.png)
+![An IBAN swapped after authorisation, rejected while the signature still verifies](docs/screenshot-iban-swap-rejected.png)
 
 ## Enabling GitHub Pages
 
@@ -96,7 +113,7 @@ const assertion = await navigator.credentials.get({
 });
 ```
 
-**The server re-hashes what it is about to execute.** This is the step that is usually missing:
+**The server re-hashes what it is about to do.** This is the step that is usually missing:
 
 ```js
 const recomputed = await sha256(concat(storedNonce, utf8(canonicalJson(executionPayload))));
@@ -104,9 +121,26 @@ if (recomputed !== clientData.challenge) reject();      // Art. 5(1)(d)
 ```
 
 A hash is one-way, so the challenge coming back tells the server nothing on its own. Only by
-re-hashing *the transaction it is about to execute* — with the nonce and transaction it kept —
-can it prove the payment is the one the payer saw. Skip this and an attacker edits the amount
+re-hashing *the record it is about to act on* — with the nonce and record it kept — can it prove
+the action is the one the customer saw. Skip this and an attacker edits the amount, or the IBAN,
 after authorisation while the signature still verifies perfectly.
+
+The technique is not payment-specific: the beneficiary flow commits the name, IBAN and match
+result the same way. Signing in commits nothing, because there is nothing to commit — its
+challenge is 32 random bytes, and the session's scope is decided by the server from its own
+records rather than from anything the client submits.
+
+## Your fallback is your real security level
+
+A phishing-resistant passkey with an SMS reset path is a phishable system: the attacker simply
+forces the downgrade. This is the most common way a passkey rollout fails to deliver the security
+it promised, and no amount of WebAuthn correctness fixes it.
+
+The workable pattern is an *unequal* fallback rather than an equivalent one — a session
+authenticated by the fallback can view and prepare, but cannot add a beneficiary or release a
+payment above a threshold without a passkey or an operator-verified re-enrolment. Enrol two
+authenticators at onboarding so losing one is routine rather than an incident. And weight the
+step-up by what the action converts into: beneficiary creation deserves the strongest you have.
 
 ## Three corrections to the commonly circulated approach
 
@@ -135,14 +169,15 @@ after authorisation while the signature still verifies perfectly.
 
 | Verification step | Provision | Why |
 | --- | --- | --- |
-| Executed transaction re-hashes to the signed challenge | Art. 5(1)(b)–(d) | The code is specific to this amount and payee, and invalid if either changes |
+| Action re-hashes to the signed challenge | Art. 5(1)(b)–(d) | The code is specific to this amount and payee, and invalid if either changes |
 | Challenge is single-use and time-boxed (5 min) | Art. 4(3) | Authentication codes are not reusable and expire |
 | `UV` flag asserted and checked | PSD2 Art. 4(30); RTS Art. 6–8 | Second, independent element beside possession |
 | Signature over `authData ‖ SHA-256(clientDataJSON)` | Art. 4(2) | Only the enrolled authenticator could have produced the code |
 | `origin` and `rpIdHash` checks | Art. 5(2); Art. 22 | Phishing resistance — a passkey will not sign for the wrong origin |
 | Signature counter and backup state recorded | Art. 2, Art. 9 | Transaction-monitoring signals; synced keys change the possession analysis |
 | Amount and payee displayed before the prompt | Art. 5(1)(a) | The payer must be aware of what they are authorising |
-| Exemption engine | Art. 10–18 | When SCA may be skipped, and the counters that end that |
+| Exemption engines | Art. 10–18 | When SCA may be skipped, and the counters and windows that end that |
+| Beneficiary name, IBAN and match result bound and displayed | Reg. (EU) 2024/886; PSD2 Art. 97(1)(c) | The customer attests to the Verification of Payee result they were shown |
 
 The Article 16 counters (≤ €30 per payment, ≤ €100 cumulative **or** ≤ 5 consecutive payments
 since the last SCA) and the Article 18 TRA bands (€100 / €250 / €500 against audited fraud rates
@@ -152,9 +187,9 @@ of 0.13 % / 0.06 % / 0.01 %) are both live in the demo.
 
 ```
 index.html                    the demo UI
-assets/js/app.js              UI orchestration and rendering
-assets/js/bank-server.js      simulated PSP: challenge minting and assertion verification
-assets/js/sca-engine.js       Articles 10–18 exemption engine
+assets/js/app.js              UI orchestration; the SCENARIOS table holds the per-action differences
+assets/js/bank-server.js      simulated PSP: challenge minting, assertion verification, portal state
+assets/js/sca-engine.js       decision engines for access, beneficiary and payment
 assets/js/client.js           navigator.credentials.* and Secure Payment Confirmation
 assets/js/webauthn-codec.js   authenticatorData, COSE keys, DER→raw ECDSA signatures
 assets/js/cbor.js             minimal CBOR decoder for the attestation object
@@ -169,8 +204,9 @@ before `crypto.subtle.verify`. There is no library to audit.
 ## Tests
 
 The full flow — registration, assertion, signature verification, dynamic linking, replay
-rejection, tampering, exemption counters, and enrolment on a browser with no `PaymentRequest` —
-is exercised against Chromium's virtual authenticator, so it runs in CI without hardware:
+rejection, tampering across all three flows, the Article 10 window, the Article 16 counters, and
+enrolment on a browser with no `PaymentRequest` — is exercised against Chromium's virtual
+authenticator, so it runs in CI without hardware (44 checks):
 
 ```bash
 npm install --no-save playwright
@@ -180,17 +216,17 @@ node tests/e2e.mjs
 
 ## What this is not
 
-**The "bank server" runs in your tab.** Every decision it makes is therefore worthless as a
+**The "portal server" runs in your tab.** Every decision it makes is therefore worthless as a
 security control — the payer can reach all of it. In a real deployment, the challenge state, the
-credential registry, the ledger and every check in step 6 live on a server. The code is
+credential registry, the beneficiary records, the ledger and every check in step 6 live on a server. The code is
 structured to make that split obvious (`bank-server.js` never touches the DOM), but it is a
 teaching model, not a starting point you can deploy.
 
 Also absent, and all mandatory in production: Article 2 transaction monitoring, Article 3
 auditing, Article 19 fraud-rate calculation and reporting (the TRA exemption is *earned* by an
-audited fraud rate, not selected from a dropdown), passkey lifecycle and account-recovery flows —
-usually where the real risk sits — and fallback authentication for payers without a usable
-authenticator.
+audited fraud rate, not selected from a dropdown), a real Verification of Payee call to the payee's
+PSP, multi-user corporate accounts with four-eyes approval, and the passkey lifecycle and
+account-recovery flows that are usually where the real risk sits.
 
 No data leaves your browser: state is held in `localStorage` and cleared by **Reset demo**. Your
 passkey stays on your device; remove it in your password manager or platform settings if you want

@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Passkeys under PSD2 — dynamic linking &amp; SCA exemptions</title>
-<meta name="description" content="A working demo of PSD2 RTS Article 5 dynamic linking with WebAuthn passkeys and Secure Payment Confirmation, plus an SCA exemption engine for Articles 10–18.">
+<title>Passkeys under PSD2 — sign-in, beneficiaries and payments</title>
+<meta name="description" content="A working demo of passkeys replacing SMS codes in a payments portal: sign-in under RTS Article 10, beneficiary changes under PSD2 Article 97(1)(c), and Article 5 dynamic linking for credit transfers.">
 <link rel="icon" href="assets/img/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="assets/css/app.css">
 </head>
@@ -15,8 +15,8 @@
     <div class="brand">
       <img src="assets/img/favicon.svg" alt="" width="34" height="34">
       <div>
-        <h1>Passkeys for PSD2 payments</h1>
-        <p>Article 5 dynamic linking &amp; the Article 10–18 exemption engine, end to end in the browser.</p>
+        <h1>Passkeys in a payments portal</h1>
+        <p>What replacing SMS codes actually involves for the three things a customer authorises: signing in, adding a beneficiary, and moving money.</p>
       </div>
     </div>
     <div class="header-actions">
@@ -29,7 +29,7 @@
 </header>
 
 <div class="wrap notice-bar">
-  <p><strong>Demonstration only.</strong> The “bank server” runs in this tab, so nothing here is trustworthy as an authorisation decision — it exists to show the protocol, the checks and the failure modes. No money moves, no data leaves your browser, and your passkey stays on your device.</p>
+  <p><strong>Demonstration only.</strong> The “portal server” runs in this tab, so nothing here is trustworthy as an authorisation decision — it exists to show the protocol, the checks and the failure modes. No money moves, no data leaves your browser, and your passkey stays on your device.</p>
 </div>
 
 <main class="wrap layout">
@@ -42,7 +42,7 @@
         <span class="step-num">1</span>
         <div>
           <h2 id="h-enrol">Enrol a passkey</h2>
-          <p class="sub">Registration binds a public key to this relying party. <code>userVerification: "required"</code> — SCA needs two elements, and only a set <abbr title="User Verified">UV</abbr> flag evidences the second.</p>
+          <p class="sub">First-party enrolment: the relying party is this portal’s own domain, so no Secure Payment Confirmation is needed and every modern browser can take part. <code>userVerification: "required"</code> — SCA needs two elements, and only a set <abbr title="User Verified">UV</abbr> flag evidences the second.</p>
         </div>
       </div>
       <div class="card-body">
@@ -55,17 +55,103 @@
       </div>
     </section>
 
-    <!-- ───────────────────────────── 2. Transaction ─────────────────────── -->
-    <section class="card" id="step-payment" aria-labelledby="h-payment">
+    <!-- ───────────────────────────── Scenario picker ────────────────────── -->
+    <nav class="scenarios" id="scenarios" aria-label="Choose an action to authorise">
+      <button type="button" class="scenario" data-scenario="login" aria-pressed="true">
+        <span class="s-title">Sign in</span>
+        <span class="s-rule">PSD2 Art. 97(1)(a) · RTS Art. 10</span>
+      </button>
+      <button type="button" class="scenario" data-scenario="beneficiary" aria-pressed="false">
+        <span class="s-title">Add a beneficiary</span>
+        <span class="s-rule">PSD2 Art. 97(1)(c) · RTS Art. 13</span>
+      </button>
+      <button type="button" class="scenario" data-scenario="payment" aria-pressed="false">
+        <span class="s-title">Make a payment</span>
+        <span class="s-rule">PSD2 Art. 97(1)(b) · RTS Art. 5</span>
+      </button>
+    </nav>
+
+    <!-- ───────────────────────────── 2. The action ──────────────────────── -->
+    <section class="card" id="step-subject" aria-labelledby="h-subject">
       <div class="card-head">
         <span class="step-num">2</span>
         <div>
-          <h2 id="h-payment">Initiate a payment</h2>
-          <p class="sub">A remote electronic credit transfer. The amount and payee here are what dynamic linking will bind the authentication code to.</p>
+          <h2 id="h-subject">The action</h2>
+          <p class="sub" id="subject-sub">What the customer is asking the portal to do.</p>
         </div>
       </div>
       <div class="card-body">
-        <form id="payment-form" autocomplete="off">
+
+        <!-- Sign in ------------------------------------------------------- -->
+        <form id="form-login" data-scenario="login" autocomplete="off">
+          <div class="identity">
+            <div class="avatar" aria-hidden="true">OB</div>
+            <div>
+              <strong id="login-name">Owen O’Byrne</strong>
+              <span class="hint" id="login-email">owen.demo@example.eu</span>
+            </div>
+          </div>
+          <label class="field">
+            <span>What this session may do</span>
+            <select id="f-scope">
+              <option value="account-information">Balances and the last 90 days of transactions only</option>
+              <option value="full-portal" selected>Full portal — initiate payments, manage beneficiaries</option>
+            </select>
+          </label>
+          <p class="hint">RTS Art. 10 exempts online access from SCA, but only for the read-only scope, only after a first authenticated access, and only within <span id="access-window">180</span> days of the last SCA. A session that can move money is never covered.</p>
+          <div class="row">
+            <button type="submit" class="btn primary">Assess sign-in</button>
+            <button type="button" class="btn ghost" id="btn-age-sca">Simulate 200 days passing</button>
+          </div>
+        </form>
+
+        <!-- Add beneficiary ----------------------------------------------- -->
+        <form id="form-beneficiary" data-scenario="beneficiary" autocomplete="off" hidden>
+          <label class="field">
+            <span>Beneficiary name</span>
+            <input type="text" id="b-name" value="Acme Manufacturing GmbH" required>
+          </label>
+          <div class="grid-2">
+            <label class="field">
+              <span>IBAN</span>
+              <input type="text" id="b-iban" value="DE89370400440532013000" required>
+            </label>
+            <label class="field">
+              <span>Country</span>
+              <input type="text" id="b-country" value="DE" maxlength="2" required>
+            </label>
+          </div>
+          <label class="field">
+            <span>Verification of Payee result <em>— Regulation (EU) 2024/886</em></span>
+            <select id="b-vop">
+              <option value="MATCH" selected>Match — the account name matches the beneficiary name</option>
+              <option value="CLOSE_MATCH">Close match — “Acme Manufacturing GmbH & Co KG”</option>
+              <option value="NO_MATCH">No match — the account is held by someone else</option>
+            </select>
+          </label>
+          <label class="check"><input type="checkbox" id="b-trusted"> <span>Add to the trusted-beneficiary list <em>(RTS Art. 13 — later payments to this payee may then be exempt)</em></span></label>
+          <p class="hint">Beneficiary creation is the pivot of most account-takeover fraud: beat this and an attacker never has to beat payment SCA. Article 5 does not reach a non-payment action, but this demo binds the name, IBAN and the Verification of Payee outcome into the challenge anyway — so the customer is cryptographically attesting to the match result they were shown.</p>
+          <div class="row">
+            <button type="submit" class="btn primary">Assess beneficiary change</button>
+          </div>
+        </form>
+
+        <!-- Payment -------------------------------------------------------- -->
+        <form id="form-payment" data-scenario="payment" autocomplete="off" hidden>
+          <label class="field">
+            <span>Payee</span>
+            <select id="f-payee-select"></select>
+          </label>
+          <div class="grid-2">
+            <label class="field">
+              <span>Payee name</span>
+              <input type="text" id="f-payee" value="Merchant XYZ Ltd" required>
+            </label>
+            <label class="field">
+              <span>Payee IBAN</span>
+              <input type="text" id="f-iban" value="IE29AIBK93115212345678" required>
+            </label>
+          </div>
           <div class="grid-2">
             <label class="field">
               <span>Amount</span>
@@ -80,30 +166,20 @@
             </label>
           </div>
           <label class="field">
-            <span>Payee name</span>
-            <input type="text" id="f-payee" value="Merchant XYZ Ltd" required>
+            <span>Reference</span>
+            <input type="text" id="f-reference" value="ORDER-8842">
           </label>
-          <div class="grid-2">
-            <label class="field">
-              <span>Payee IBAN</span>
-              <input type="text" id="f-iban" value="IE29AIBK93115212345678" required>
-            </label>
-            <label class="field">
-              <span>Reference</span>
-              <input type="text" id="f-reference" value="ORDER-8842">
-            </label>
-          </div>
 
           <fieldset class="context">
             <legend>Payer-PSP context <span class="legend-note">— drives the exemption engine</span></legend>
             <div class="toggles">
-              <label class="check"><input type="checkbox" id="c-trusted"> <span>Payee on trusted-beneficiary list <em>(Art. 13)</em></span></label>
               <label class="check"><input type="checkbox" id="c-recurring"> <span>Recurring mandate registered <em>(Art. 14)</em></span></label>
               <label class="check sub-check"><input type="checkbox" id="c-first" checked> <span>…and this is the first payment of the series</span></label>
               <label class="check"><input type="checkbox" id="c-self"> <span>Payer’s own account at this PSP <em>(Art. 15)</em></span></label>
               <label class="check"><input type="checkbox" id="c-corporate"> <span>Dedicated corporate process <em>(Art. 17)</em></span></label>
               <label class="check"><input type="checkbox" id="c-force"> <span>Apply SCA even if an exemption is available</span></label>
             </div>
+            <p class="hint">Trusted-beneficiary status (Art. 13) is not a checkbox here — it comes from whether the selected payee was added to the list in the beneficiary flow, which itself required SCA.</p>
             <div class="grid-2">
               <label class="field">
                 <span>Real-time risk score <output id="out-risk">12</output>/100 <em>(Art. 18(2)(c))</em></span>
@@ -135,21 +211,21 @@
         <span class="step-num">3</span>
         <div>
           <h2 id="h-sca">SCA decision</h2>
-          <p class="sub">Regulation (EU) 2018/389, Articles 10–18. Every candidate exemption is evaluated, including the ones that miss.</p>
+          <p class="sub">Why SCA is in scope at all, and every candidate exemption — including the ones that miss.</p>
         </div>
       </div>
       <div class="card-body" id="sca-body">
-        <p class="placeholder">Submit a payment above to see the assessment.</p>
+        <p class="placeholder">Submit an action above to see the assessment.</p>
       </div>
     </section>
 
-    <!-- ───────────────────────────── 4. Dynamic linking ─────────────────── -->
+    <!-- ───────────────────────────── 4. Binding ─────────────────────────── -->
     <section class="card is-idle" id="step-link" aria-labelledby="h-link">
       <div class="card-head">
         <span class="step-num">4</span>
         <div>
-          <h2 id="h-link">Dynamic linking</h2>
-          <p class="sub">The challenge is <code>SHA-256(nonce ‖ canonical-JSON(transaction))</code>. The nonce keeps it unpredictable; the canonical encoding keeps it reproducible at verification.</p>
+          <h2 id="h-link">Challenge &amp; confirmation</h2>
+          <p class="sub">For anything with an amount or a payee, the challenge is <code>SHA-256(nonce ‖ canonical-JSON(action))</code>. The nonce keeps it unpredictable; the canonical encoding keeps it reproducible at verification.</p>
         </div>
       </div>
       <div class="card-body" id="link-body">
@@ -163,11 +239,11 @@
         <span class="step-num">5</span>
         <div>
           <h2 id="h-auth">Authorise with the passkey</h2>
-          <p class="sub">Secure Payment Confirmation puts the amount and payee inside a browser-rendered dialog and signs them. Where SPC is unavailable, the page shows them itself and signs the bound challenge.</p>
+          <p class="sub">One touch, origin-bound, phishing-resistant — and, unlike an SMS code, impossible to read out to someone on the phone.</p>
         </div>
       </div>
       <div class="card-body" id="auth-body">
-        <p class="placeholder">Waiting for a dynamically linked challenge.</p>
+        <p class="placeholder">Waiting for a challenge.</p>
       </div>
     </section>
 
@@ -177,7 +253,7 @@
         <span class="step-num">6</span>
         <div>
           <h2 id="h-verify">Server-side verification</h2>
-          <p class="sub">Signature, origin, flags, freshness — and the check that matters for Article 5: the transaction about to be executed must re-hash to the challenge that was signed.</p>
+          <p class="sub">Signature, origin, flags, freshness — and, where the action has an amount or a payee, the check that matters for Article 5: what is about to happen must re-hash to what was signed.</p>
         </div>
       </div>
       <div class="card-body" id="verify-body">
@@ -197,16 +273,54 @@
       <div class="card-body">
 
         <details open>
+          <summary>Which rule applies to which action</summary>
+          <div class="table-scroll">
+            <table class="mapping">
+              <thead><tr><th>Action</th><th>SCA required by</th><th>Exemption</th><th>Dynamic linking</th></tr></thead>
+              <tbody>
+                <tr>
+                  <td>Signing in</td>
+                  <td>PSD2 Art. 97(1)(a)</td>
+                  <td>RTS Art. 10 — read-only scope, not first access, within 180 days of the last SCA</td>
+                  <td>Not applicable: no amount, no payee</td>
+                </tr>
+                <tr>
+                  <td>Adding or amending a beneficiary</td>
+                  <td>PSD2 Art. 97(1)(c); RTS Art. 13(1) for the trusted list</td>
+                  <td>None — Art. 10–18 exemptions reach payment transactions and account access, not payee records</td>
+                  <td>Not mandated, but worth doing: bind name, IBAN and the Verification of Payee result</td>
+                </tr>
+                <tr>
+                  <td>Initiating a credit transfer</td>
+                  <td>PSD2 Art. 97(1)(b)</td>
+                  <td>RTS Art. 13–18, subject to counters and audited fraud rates</td>
+                  <td>Mandatory under RTS Art. 5 whenever SCA is applied</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </details>
+
+        <details>
+          <summary>Your fallback is your real security level</summary>
+          <div class="prose">
+            <p>A phishing-resistant passkey with an SMS reset path is a phishable system: the attacker simply forces the downgrade. This is the most common way a passkey rollout fails to deliver the security it promised, and no amount of WebAuthn correctness fixes it.</p>
+            <p>The workable pattern is an <em>unequal</em> fallback rather than an equivalent one. A session authenticated by the fallback can view and prepare, but cannot add a beneficiary or release a payment above a threshold without either a passkey or an operator-verified re-enrolment. Enrol two authenticators at onboarding — a second device, or a security key — so that losing one is routine rather than an incident.</p>
+            <p>The same reasoning applies to what an attacker gains from each action. Beneficiary creation deserves the <em>strongest</em> step-up you have, because it converts into every future payment.</p>
+          </div>
+        </details>
+
+        <details>
           <summary>The three corrections</summary>
           <ol class="corrections">
             <li>
               <p><strong><code>userVerification: "discouraged"</code> defeats SCA.</strong> PSD2 Article 4(30) requires two independent elements. A passkey assertion with only <abbr title="User Present">UP</abbr> set evidences <em>possession</em> alone. The second element — inherence (biometric) or knowledge (device PIN) — is evidenced only by the <abbr title="User Verified">UV</abbr> flag, and you get that by asking for <code>userVerification: "required"</code> and then <em>verifying the flag server-side</em>. Asking politely is not enough; the flag is the evidence.</p>
             </li>
             <li>
-              <p><strong>There is no <code>extensions.payment</code> dictionary on <code>navigator.credentials.get()</code>.</strong> The real mechanism is Secure Payment Confirmation: a <code>PaymentRequest</code> with the <code>secure-payment-confirmation</code> method, whose <code>response.details</code> is a <code>PublicKeyCredential</code>. The browser — not the page — renders the amount and payee, and writes them into <code>clientDataJSON</code> as <code>clientData.payment</code>, where the server can verify them. At registration the credential opts in with <code>extensions: { payment: { isPayment: true } }</code> — but only where the browser exposes <code>PaymentRequest</code> at all, because the SPC specification has <code>create()</code> throw <code>NotSupportedError</code> on a user agent without SPC, which would block enrolment outright rather than merely disabling SPC. Enrolment then steps down through fewer options (no payment extension, then ES256 and RS256, then ES256 alone) until the browser accepts, and the audit log records which one it was.</p>
+              <p><strong>There is no <code>extensions.payment</code> dictionary on <code>navigator.credentials.get()</code>.</strong> The real mechanism is Secure Payment Confirmation: a <code>PaymentRequest</code> with the <code>secure-payment-confirmation</code> method, whose <code>response.details</code> is a <code>PublicKeyCredential</code>. Its purpose is letting a <em>merchant</em> origin invoke a <em>bank’s</em> credential cross-origin — so a first-party portal, where the relying party and the page are the same origin, does not need it at all, and gains full browser support by leaving it out. This demo requests it only where the browser exposes <code>PaymentRequest</code>, because the SPC specification has <code>create()</code> throw <code>NotSupportedError</code> where SPC is unsupported, which would block enrolment outright.</p>
             </li>
             <li>
-              <p><strong>Hashing the transaction is only half of dynamic linking.</strong> A hash is one-way, so a challenge alone tells the server nothing on its return journey. The server must keep the authoritative transaction (and the nonce) alongside the challenge, then re-hash <em>the transaction it is about to execute</em> and require that it equals the challenge inside the signed <code>clientDataJSON</code>. Without that final comparison, an attacker changes the amount after authorisation and the signature still verifies. Try it in step 5.</p>
+              <p><strong>Hashing the transaction is only half of dynamic linking.</strong> A hash is one-way, so a challenge alone tells the server nothing on its return journey. The server must keep the authoritative record (and the nonce) alongside the challenge, then re-hash <em>what it is about to do</em> and require that it equals the challenge inside the signed <code>clientDataJSON</code>. Without that final comparison, an attacker changes the amount — or the IBAN — after authorisation and the signature still verifies. Try it in step 5.</p>
             </li>
           </ol>
         </details>
@@ -221,7 +335,7 @@
               <li><strong>(c)</strong> the code changes if the amount or the payee changes;</li>
               <li><strong>(d)</strong> any change to the amount or payee invalidates the code.</li>
             </ul>
-            <p>In WebAuthn terms: (a) is the visual confirmation — the panel in step 4, or the browser’s own SPC dialog; (b) and (c) come from committing the transaction into the challenge; (d) comes from the server refusing to execute anything that does not re-hash to the signed challenge, plus single-use consumption of the challenge.</p>
+            <p>In WebAuthn terms: (a) is the confirmation panel in step 4; (b) and (c) come from committing the transaction into the challenge; (d) comes from the server refusing to execute anything that does not re-hash to the signed challenge, plus single-use consumption of the challenge.</p>
             <p>Article 5(2) adds confidentiality, authenticity and integrity requirements for the amount and payee “throughout all phases of the authentication”, which is why the origin check and the <code>crossOrigin</code> check are not optional extras.</p>
           </div>
         </details>
@@ -232,13 +346,12 @@
             <table class="mapping">
               <thead><tr><th>Verification step</th><th>Provision</th><th>Why</th></tr></thead>
               <tbody>
-                <tr><td>Challenge re-hashes to the executed transaction</td><td>Art. 5(1)(b)–(d)</td><td>The authentication code is specific to this amount and payee, and dies if either changes.</td></tr>
+                <tr><td>Action re-hashes to the signed challenge</td><td>Art. 5(1)(b)–(d)</td><td>The authentication code is specific to this amount and payee, and dies if either changes.</td></tr>
                 <tr><td>Challenge is single-use and time-boxed</td><td>Art. 4(3)</td><td>An authentication code may not be reusable; codes expire.</td></tr>
-                <tr><td>UV flag set</td><td>PSD2 Art. 4(30); RTS Art. 6–8</td><td>Second, independent element (inherence or knowledge) beside possession of the authenticator.</td></tr>
+                <tr><td>UV flag set</td><td>PSD2 Art. 4(30); RTS Art. 6–8</td><td>Second, independent element beside possession of the authenticator.</td></tr>
                 <tr><td>Signature over <code>authData ‖ SHA-256(clientDataJSON)</code></td><td>Art. 4(2)</td><td>Only the enrolled authenticator could have produced the code.</td></tr>
-                <tr><td>Origin and <code>rpIdHash</code> checks</td><td>Art. 5(2); Art. 22</td><td>Phishing resistance — a passkey simply will not sign for the wrong origin.</td></tr>
+                <tr><td>Origin and <code>rpIdHash</code> checks</td><td>Art. 5(2); Art. 22</td><td>Phishing resistance — a passkey simply will not sign for the wrong origin. This is the property SMS codes do not have.</td></tr>
                 <tr><td>Signature counter / backup-state recording</td><td>Art. 2, Art. 9</td><td>Transaction-monitoring signals; multi-device synced keys change the possession analysis.</td></tr>
-                <tr><td>Exemption engine</td><td>Art. 10–18</td><td>When SCA may be skipped — and the counters that bring it back.</td></tr>
               </tbody>
             </table>
           </div>
@@ -247,10 +360,11 @@
         <details>
           <summary>Where passkeys get interesting under the RTS</summary>
           <div class="prose">
-            <p><strong>Synced passkeys and “possession”.</strong> A passkey with <code>BE=1, BS=1</code> is backed up to the payer’s cloud account and present on several devices. Supervisors have accepted synced credentials, but the possession element is then a key protected by the payer’s platform account rather than by one device’s secure element. That belongs in your Article 2 transaction-monitoring model — this demo surfaces the flags for exactly that reason.</p>
-            <p><strong>Independence (Art. 9).</strong> The elements must be independent: breach of one must not compromise the other. On a passkey, possession is a key held in the authenticator’s secure hardware and inherence is verified locally by the platform, which is what makes the combination defensible — but the analysis depends on the device’s secure execution environment, not on WebAuthn alone.</p>
-            <p><strong>Attestation.</strong> This demo requests <code>attestation: "none"</code>. A PSP that wants assurance about which authenticator model holds the key needs attestation and a metadata service to check it against, and must weigh that against privacy and enrolment friction.</p>
-            <p><strong>Relying-party identifier.</strong> Hosted on GitHub Pages the RP ID is the <code>*.github.io</code> subdomain, which works because <code>github.io</code> sits on the Public Suffix List. A real PSP scopes credentials to its own registrable domain and lives with the fact that RP ID cannot be changed later without re-enrolling every payer.</p>
+            <p><strong>Synced passkeys and “possession”.</strong> A passkey with <code>BE=1, BS=1</code> is backed up to the customer’s platform account and present on several devices. The mainstream industry position is that this still satisfies possession, but supervisory comfort varies, and corporate IT departments may object to keys syncing into personal cloud accounts. Record the flags on every assertion — this demo does — so the analysis is evidenced rather than asserted, and consider requiring device-bound credentials or enterprise attestation for your highest-value approvers.</p>
+            <p><strong>Independence (Art. 9).</strong> The elements must be independent: breach of one must not compromise the other. On a passkey, possession is a key held in the authenticator’s secure hardware and inherence is verified locally by the platform — but the analysis rests on the device’s secure execution environment, not on WebAuthn alone.</p>
+            <p><strong>Corporate access is the hard part.</strong> Multiple named users per client, four-eyes approval, delegated authority and staff turnover. Passkeys are per-person-per-device, so offboarding must revoke credentials and re-enrolment needs an out-of-band identity check you are willing to defend. Recovery, not cryptography, is where this work actually hurts.</p>
+            <p><strong>Attestation.</strong> This demo requests <code>attestation: "none"</code>. A PSP that wants assurance about which authenticator model holds the key needs attestation and a metadata service to check it against, weighed against privacy and enrolment friction.</p>
+            <p><strong>Relying-party identifier.</strong> Hosted on GitHub Pages the RP ID is the <code>*.github.io</code> subdomain, which works because <code>github.io</code> sits on the Public Suffix List. A real portal scopes credentials to its own registrable domain and lives with the fact that RP ID cannot be changed later without re-enrolling every customer.</p>
           </div>
         </details>
 
@@ -258,10 +372,10 @@
           <summary>What a real deployment needs that this does not have</summary>
           <div class="prose">
             <ul>
-              <li>A genuine server: challenge state, credential registry, ledger and every check in step 6 must run somewhere the payer cannot reach. Here they run in your tab.</li>
-              <li>Article 2 transaction monitoring, Article 3 auditing, and Article 19 fraud-rate calculation and reporting — the TRA exemption is earned by an audited fraud rate, not by a checkbox.</li>
-              <li>Account-recovery and passkey lifecycle flows, which are usually where the real risk sits.</li>
-              <li>Accessibility and fallback authentication for payers without a usable authenticator.</li>
+              <li>A genuine server: challenge state, credential registry, beneficiary records, ledger and every check in step 6 must run somewhere the customer cannot reach. Here they run in your tab.</li>
+              <li>Article 2 transaction monitoring, Article 3 auditing, and Article 19 fraud-rate calculation and reporting — the TRA exemption is earned by an audited fraud rate, not by a dropdown.</li>
+              <li>A real Verification of Payee call to the payee’s PSP, rather than a picker.</li>
+              <li>Passkey lifecycle and account recovery, multi-user corporate accounts, and a restricted fallback for customers without a usable authenticator.</li>
             </ul>
           </div>
         </details>
@@ -283,14 +397,19 @@ python3 -m http.server 8000
 
   <!-- ───────────────────────────── Right rail ───────────────────────────── -->
   <aside class="rail">
+    <section class="card compact" aria-labelledby="h-portal">
+      <div class="card-head"><div><h2 id="h-portal">Portal state</h2></div></div>
+      <div class="card-body" id="portal-state"></div>
+    </section>
+
     <section class="card compact" aria-labelledby="h-counters">
       <div class="card-head"><div><h2 id="h-counters">Article 16 counters</h2></div></div>
       <div class="card-body" id="counters"></div>
     </section>
 
     <section class="card compact" aria-labelledby="h-ledger">
-      <div class="card-head"><div><h2 id="h-ledger">Executed payments</h2></div></div>
-      <div class="card-body" id="ledger"><p class="placeholder">Nothing executed yet.</p></div>
+      <div class="card-head"><div><h2 id="h-ledger">Activity</h2></div></div>
+      <div class="card-body" id="ledger"><p class="placeholder">Nothing yet.</p></div>
     </section>
 
     <section class="card compact console" aria-labelledby="h-log">

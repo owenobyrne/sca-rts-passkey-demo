@@ -172,7 +172,46 @@ abbr { text-decoration: none; border-bottom: 1px dotted var(--ink-3); cursor: he
 .field input[type="range"] { accent-color: var(--accent); }
 .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 560px) { .grid-2 { grid-template-columns: 1fr; } }
-#payment-form { display: flex; flex-direction: column; gap: 12px; }
+#form-login, #form-beneficiary, #form-payment { display: flex; flex-direction: column; gap: 12px; }
+[hidden] { display: none !important; }
+
+/* ------------------------------------------------------------- scenarios -- */
+.scenarios { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.scenario {
+  text-align: left; cursor: pointer;
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 13px 15px; border-radius: 12px;
+  border: 1px solid var(--line);
+  background: linear-gradient(180deg, var(--surface), var(--bg-2));
+  transition: border-color .15s ease, background .15s ease;
+  font: inherit;
+}
+.scenario:hover { border-color: #2e3b52; }
+.scenario:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.scenario[aria-pressed="true"] { border-color: rgba(91,140,255,.55); background: rgba(91,140,255,.12); }
+.s-title { font-weight: 640; font-size: 14px; color: var(--ink); }
+.s-rule { font-family: var(--mono); font-size: 11px; color: var(--ink-3); }
+.scenario[aria-pressed="true"] .s-rule { color: var(--accent); }
+@media (max-width: 700px) { .scenarios { grid-template-columns: 1fr; } }
+
+/* -------------------------------------------------------------- identity -- */
+.identity { display: flex; gap: 12px; align-items: center; }
+.identity strong { display: block; font-size: 15px; }
+.identity .hint { display: block; }
+.avatar {
+  width: 42px; height: 42px; border-radius: 50%; flex: none;
+  display: grid; place-items: center;
+  background: rgba(91,140,255,.16); border: 1px solid rgba(91,140,255,.35);
+  color: var(--accent); font-weight: 640; font-size: 14px;
+}
+
+/* ----------------------------------------------------------- legal basis -- */
+.basis {
+  display: flex; gap: 12px; align-items: baseline; flex-wrap: wrap;
+  font-size: 12.5px; color: var(--ink-2);
+  border-left: 2px solid var(--line); padding-left: 12px;
+}
+.basis-art { font-family: var(--mono); font-size: 11.5px; color: var(--accent); white-space: nowrap; }
 
 .context {
   border: 1px solid var(--line-soft);
@@ -230,6 +269,7 @@ abbr { text-decoration: none; border-bottom: 1px dotted var(--ink-3); cursor: he
 }
 .chip.good { color: var(--ok); border-color: rgba(61,220,151,.3); background: rgba(61,220,151,.08); }
 .chip.warn { color: var(--warn); border-color: rgba(240,180,41,.3); background: rgba(240,180,41,.08); }
+.chip.bad { color: var(--bad); border-color: rgba(255,107,107,.35); background: rgba(255,107,107,.1); }
 
 /* ------------------------------------------------------------- decisions -- */
 .verdict {
@@ -278,6 +318,7 @@ abbr { text-decoration: none; border-bottom: 1px dotted var(--ink-3); cursor: he
 .confirm .payee { font-size: 18px; font-weight: 640; }
 .confirm .meta { display: flex; gap: 18px; flex-wrap: wrap; font-family: var(--mono); font-size: 12px; color: var(--ink-2); }
 .confirm .foot { font-size: 12px; color: var(--ink-3); border-top: 1px solid rgba(255,255,255,.08); padding-top: 12px; }
+.confirm .foot.warn-foot { color: #f3d99b; border-top-color: rgba(240,180,41,.35); }
 
 /* -------------------------------------------------------------- checklist -- */
 .checklist { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
