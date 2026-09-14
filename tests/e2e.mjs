@@ -359,6 +359,45 @@ check('the fallback still produces a valid authorisation', spcRows.every((c) => 
 check('no page errors on the SPC path', spcErrors.length === 0, spcErrors.join(' | '));
 await spcContext.close();
 
+// --- a passkey that is not a local platform authenticator ------------------
+// The portal is opened on a desktop while the passkey lives elsewhere — on a
+// phone over hybrid transport, or on a security key. Chromium's virtual
+// authenticator cannot emulate hybrid ("cable" is not a valid CDP transport),
+// so this covers the next closest thing: a credential whose transport is not
+// "internal", proving nothing in the flow assumes a platform authenticator.
+for (const transport of ['ble', 'usb']) {
+  const roamingContext = await browser.newContext();
+  const roaming = await roamingContext.newPage();
+  const roamingErrors = [];
+  roaming.on('pageerror', (error) => roamingErrors.push(error.message));
+  const roamingCdp = await roamingContext.newCDPSession(roaming);
+  await roamingCdp.send('WebAuthn.enable');
+  await roamingCdp.send('WebAuthn.addVirtualAuthenticator', {
+    options: { ...AUTHENTICATOR, transport },
+  });
+
+  await roaming.goto(BASE, { waitUntil: 'networkidle' });
+  await roaming.click('#btn-register');
+  await roaming.waitForSelector('.cred h3', { timeout: 20000 });
+  check(`a ${transport} credential enrols`, new RegExp(transport).test(await roaming.locator('#cred-list').innerText()));
+
+  await roaming.click('#scenarios .scenario[data-scenario="payment"]');
+  await roaming.click('#btn-assess');
+  await roaming.waitForSelector('#btn-proceed-sca');
+  await roaming.click('#btn-proceed-sca');
+  await roaming.waitForSelector('#btn-auth-plain');
+  await roaming.click('#btn-auth-plain');
+  await roaming.waitForFunction(
+    () => /credited to/.test(document.querySelector('#verify-body')?.textContent ?? ''),
+    null,
+    { timeout: 20000 },
+  );
+  const rows = await cells(roaming, '#verify-body .checklist li');
+  check(`a ${transport} credential authorises a payment`, rows.length > 0 && rows.every((c) => c.state !== 'fail'), JSON.stringify(rows.filter((c) => c.state === 'fail')));
+  check(`no page errors on the ${transport} path`, roamingErrors.length === 0, roamingErrors.join(' | '));
+  await roamingContext.close();
+}
+
 // --- state written by an earlier version of the demo -----------------------
 // The three-scenario rewrite changed the ledger shape. State persists in
 // localStorage across deploys, so an unmigrated entry must not break startup.

@@ -314,6 +314,17 @@
         </details>
 
         <details>
+          <summary>The passkey on a phone, the portal on a desktop</summary>
+          <div class="prose">
+            <p>This works, and it is a first-class flow: <strong>hybrid transport</strong>, also called cross-device authentication. The desktop shows a QR code, the phone scans it, the two prove physical proximity over Bluetooth, and the assertion travels back through an encrypted tunnel. Every current desktop browser supports it, with iOS and Android acting as the authenticator.</p>
+            <p>The Bluetooth proximity step is not decoration. It is what stops an attacker relaying a QR code to a distant victim: the phone will only complete the exchange with a device that is physically beside it, so a QR shown on a phishing page cannot be redeemed from somewhere else.</p>
+            <p><strong>But a passkey on a phone is not a second channel.</strong> The phone’s prompt names the site, exactly as a local prompt would — it does not show the amount or the payee. Reaching for your phone <em>feels</em> like out-of-band transaction confirmation, and it is not: hybrid moves where the key lives, not what the customer gets to verify. Closing the gap described above still needs an application that renders the transaction on the phone and takes the approval there.</p>
+            <p>Expect friction. Unless the desktop and phone are linked, or the passkey already syncs to the desktop through the same platform account, it is QR plus camera plus Bluetooth on every authentication — noticeably slower than typing an SMS code, and paid on every payment. The usual answer is to enrol a passkey on the desktop as well and keep the phone for bootstrapping and recovery.</p>
+            <p>Two deployment blockers worth checking before committing: corporate builds that disable Bluetooth or the camera cannot do hybrid at all, and virtual desktop environments often cannot reach a local authenticator without specific WebAuthn redirection. Finance teams are disproportionately likely to be working in exactly those environments.</p>
+          </div>
+        </details>
+
+        <details>
           <summary>Your fallback is your real security level</summary>
           <div class="prose">
             <p>A phishing-resistant passkey with an SMS reset path is a phishable system: the attacker simply forces the downgrade. This is the most common way a passkey rollout fails to deliver the security it promised, and no amount of WebAuthn correctness fixes it.</p>

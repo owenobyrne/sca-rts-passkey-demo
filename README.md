@@ -148,6 +148,22 @@ device with its own display closes it. And note that an SMS containing the amoun
 independent display channel that passkeys give up — an argument for passkeys plus a second-channel
 confirmation above a value threshold, not for keeping SMS.
 
+## The passkey on a phone, the portal on a desktop
+
+Supported, and a first-class flow: **hybrid transport** (cross-device authentication). QR code on
+the desktop, camera on the phone, Bluetooth proximity, assertion back through an encrypted tunnel.
+The proximity step is what stops an attacker relaying a QR code to a distant victim.
+
+**But a passkey on a phone is not a second channel.** The phone's prompt names the site, not the
+amount or payee — hybrid changes where the key lives, not what the customer can verify. It does
+not close the gap above; that still needs an app that renders the transaction on the phone.
+
+Expect friction: unless the devices are linked or the passkey already syncs to the desktop, it is
+QR plus camera plus Bluetooth on every authentication. Enrolling a passkey on the desktop too, and
+keeping the phone for bootstrapping and recovery, is usually the better shape. Check two blockers
+first: corporate builds that disable Bluetooth or the camera cannot do hybrid at all, and virtual
+desktop environments often cannot reach a local authenticator without WebAuthn redirection.
+
 ## Your fallback is your real security level
 
 A phishing-resistant passkey with an SMS reset path is a phishable system: the attacker simply
