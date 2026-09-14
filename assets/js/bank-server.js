@@ -105,7 +105,12 @@ export class BankServer {
    * of the authenticator plus inherence (biometric) or knowledge (device PIN) —
    * and only a set UV flag evidences the second one.
    */
-  beginRegistration() {
+  /**
+   * @param {object} [tuning]
+   * @param {boolean} [tuning.payment]      request the SPC `payment` extension
+   * @param {number[]} [tuning.algorithms]  COSE algorithms to offer, in order
+   */
+  beginRegistration({ payment = true, algorithms = [COSE_ALG.ES256, COSE_ALG.EdDSA, COSE_ALG.RS256] } = {}) {
     const challenge = randomBytes(32);
     this.registrationChallenge = challenge;
 
@@ -117,11 +122,7 @@ export class BankServer {
         name: this.state.user.name,
         displayName: this.state.user.displayName,
       },
-      pubKeyCredParams: [
-        { type: 'public-key', alg: COSE_ALG.ES256 },
-        { type: 'public-key', alg: COSE_ALG.EdDSA },
-        { type: 'public-key', alg: COSE_ALG.RS256 },
-      ],
+      pubKeyCredParams: algorithms.map((alg) => ({ type: 'public-key', alg })),
       excludeCredentials: this.credentials.map((c) => ({
         type: 'public-key',
         id: b64uDecode(c.credentialId),
@@ -135,9 +136,12 @@ export class BankServer {
       timeout: 120000,
       extensions: {
         credProps: true,
-        // Marks the credential as usable by Secure Payment Confirmation where
-        // the browser supports it (Chromium). Ignored elsewhere.
-        payment: { isPayment: true },
+        // Marks the credential as usable by Secure Payment Confirmation.
+        // Only requested where the browser exposes PaymentRequest at all: the
+        // SPC specification has create() throw NotSupportedError when the user
+        // agent does not support SPC, which would otherwise block enrolment
+        // outright on browsers that have no SPC implementation.
+        ...(payment ? { payment: { isPayment: true } } : {}),
       },
     };
   }

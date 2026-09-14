@@ -22,7 +22,7 @@ import {
   friendlyWebauthnError,
   probeEnvironment,
 } from './client.js';
-import { describeFlags } from './webauthn-codec.js';
+import { COSE_ALG, describeFlags } from './webauthn-codec.js';
 
 const $ = (id) => document.getElementById(id);
 const esc = (value) =>
@@ -124,18 +124,66 @@ function renderCredentials() {
   });
 }
 
+/**
+ * Enrolment retry ladder.
+ *
+ * A browser that will not accept one of the optional parts of the request
+ * throws NotSupportedError before any prompt is shown, so stepping down costs
+ * the payer nothing — and the step that succeeds tells us exactly what their
+ * stack supports. The SPC `payment` extension is the usual culprit: the Secure
+ * Payment Confirmation specification requires create() to throw
+ * NotSupportedError on a user agent with no SPC implementation, which would
+ * otherwise block enrolment outright rather than merely disabling SPC.
+ */
+function registrationVariants() {
+  const variants = [];
+  if (env.paymentRequest) {
+    variants.push({ note: 'ES256/EdDSA/RS256 with the SPC payment extension', tuning: { payment: true } });
+  }
+  variants.push({ note: 'ES256/EdDSA/RS256, no payment extension', tuning: { payment: false } });
+  variants.push({
+    note: 'ES256 and RS256 only',
+    tuning: { payment: false, algorithms: [COSE_ALG.ES256, COSE_ALG.RS256] },
+  });
+  variants.push({ note: 'ES256 only', tuning: { payment: false, algorithms: [COSE_ALG.ES256] } });
+  return variants;
+}
+
 async function onRegister() {
   const button = $('btn-register');
   button.disabled = true;
   $('register-hint').textContent = 'Follow your device prompt…';
   try {
-    const options = server.beginRegistration();
-    log('step', 'POST /webauthn/register/begin → options issued', {
-      rpId: options.rp.id,
-      userVerification: options.authenticatorSelection.userVerification,
-      algs: options.pubKeyCredParams.map((p) => p.alg),
-    });
-    const credential = await createPasskey(options);
+    let credential = null;
+    let accepted = null;
+    let lastError = null;
+
+    for (const variant of registrationVariants()) {
+      const options = server.beginRegistration(variant.tuning);
+      log('step', `POST /webauthn/register/begin → ${variant.note}`, {
+        rpId: options.rp.id,
+        userVerification: options.authenticatorSelection.userVerification,
+        algs: options.pubKeyCredParams.map((param) => param.alg),
+        extensions: Object.keys(options.extensions),
+      });
+      try {
+        credential = await createPasskey(options);
+        accepted = variant;
+        break;
+      } catch (error) {
+        lastError = error;
+        // Only a parameter refusal is worth retrying. A cancellation, a
+        // duplicate credential or a bad origin means stop and say so.
+        if (error?.name !== 'NotSupportedError') throw error;
+        log('warn', `Refused (${variant.note}) — stepping down and retrying`, error.message || error.name);
+      }
+    }
+
+    if (!credential) throw lastError ?? new Error('No registration variant was accepted.');
+    if (accepted.tuning.payment !== true) {
+      log('info', `Enrolled without the SPC payment extension (${accepted.note}); this credential will use plain WebAuthn with the page-rendered confirmation.`);
+    }
+
     const result = await server.finishRegistration(credential);
     $('reg-result').innerHTML = renderChecklist(result.checks.map((c) => ({ ...c, status: c.status })));
     if (result.ok) {
@@ -150,9 +198,16 @@ async function onRegister() {
     refreshGates();
   } catch (error) {
     log('bad', `Registration failed — ${friendlyWebauthnError(error)}`);
-    $('reg-result').innerHTML = `<div class="verdict fail"><span class="icon">✗</span><div><h3>Registration failed</h3><p>${esc(
-      friendlyWebauthnError(error),
-    )}</p></div></div>`;
+    $('reg-result').innerHTML = `<div class="verdict fail">
+      <span class="icon">✗</span>
+      <div>
+        <h3>Registration failed</h3>
+        <p>${esc(friendlyWebauthnError(error))}</p>
+        <p class="hint">Every fallback was tried: ${esc(registrationVariants().map((v) => v.note).join('; '))}. This browser reports secure context ${
+          env.secureContext ? 'yes' : 'no'
+        }, platform authenticator ${env.platformAuthenticator ? 'yes' : 'no'}, origin ${esc(env.origin)}.</p>
+      </div>
+    </div>`;
   } finally {
     button.disabled = false;
     $('register-hint').textContent = '';

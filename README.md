@@ -121,9 +121,13 @@ after authorisation while the signature still verifies perfectly.
    `secure-payment-confirmation` method, whose `response.details` is a `PublicKeyCredential`. The
    browser renders the amount and payee and writes them into `clientDataJSON` as
    `clientData.payment`, where the server verifies them. Credentials opt in at registration with
-   `extensions: { payment: { isPayment: true } }`. SPC is Chromium-only today, so treat it as an
-   enhancement: this demo tries it first and falls back to plain WebAuthn with a page-rendered
-   confirmation panel. The challenge binding is identical either way.
+   `extensions: { payment: { isPayment: true } }` — and that extension must only be sent where the
+   browser exposes `PaymentRequest`, because the SPC specification has `create()` throw
+   `NotSupportedError` on a user agent without SPC. Ask for it unconditionally and you do not
+   merely lose SPC, you lose enrolment. SPC is Chromium-only today, so treat it as an enhancement:
+   this demo requests it only where it can work, steps enrolment down through fewer options if the
+   browser still refuses, and falls back to plain WebAuthn with a page-rendered confirmation panel.
+   The challenge binding is identical either way.
 
 3. **Hashing the transaction is only half of dynamic linking** — see the re-hash step above.
 
@@ -165,8 +169,8 @@ before `crypto.subtle.verify`. There is no library to audit.
 ## Tests
 
 The full flow — registration, assertion, signature verification, dynamic linking, replay
-rejection, tampering, exemption counters — is exercised against Chromium's virtual authenticator,
-so it runs in CI without hardware:
+rejection, tampering, exemption counters, and enrolment on a browser with no `PaymentRequest` —
+is exercised against Chromium's virtual authenticator, so it runs in CI without hardware:
 
 ```bash
 npm install --no-save playwright

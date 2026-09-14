@@ -20,6 +20,7 @@ export async function probeEnvironment() {
     webauthn: typeof window.PublicKeyCredential === 'function',
     platformAuthenticator: false,
     conditionalMediation: false,
+    paymentRequest: typeof window.PaymentRequest === 'function',
     spc: false,
   };
 
@@ -137,19 +138,26 @@ export function serialiseAssertion(credential) {
   };
 }
 
+/**
+ * Explain a WebAuthn failure without hiding the browser's own words: the
+ * underlying name and message are what make these diagnosable.
+ */
 export function friendlyWebauthnError(error) {
   const name = error?.name ?? '';
+  const raw = error?.message ? ` (${name}: ${error.message})` : name ? ` (${name})` : '';
   switch (name) {
     case 'NotAllowedError':
-      return 'The authorisation was cancelled, or timed out, or the browser blocked it (a passkey prompt needs a user gesture on a secure origin).';
+      return `The request was cancelled, timed out, or the browser blocked it — a passkey prompt needs a user gesture on a secure origin.${raw}`;
     case 'InvalidStateError':
-      return 'A passkey for this site already exists on that authenticator.';
+      return `A passkey for this site already exists on that authenticator.${raw}`;
     case 'SecurityError':
-      return `The relying party ID does not match this origin (${location.origin}). Passkeys only work over HTTPS or on localhost.`;
+      return `The relying party ID does not match this origin (${location.origin}). Passkeys need HTTPS, or localhost — an IP address is not a valid RP ID.${raw}`;
     case 'NotSupportedError':
-      return 'No requested algorithm is supported by the available authenticator.';
+      return `The browser or authenticator refused these request parameters — usually an unsupported public-key algorithm, or an extension the browser will not accept (the SPC "payment" extension is the common one).${raw}`;
     case 'AbortError':
-      return 'The request was aborted.';
+      return `The request was aborted.${raw}`;
+    case 'ConstraintError':
+      return `The authenticator could not satisfy a constraint — most often user verification being required with no PIN or biometric set up.${raw}`;
     default:
       return error?.message ? `${name || 'Error'}: ${error.message}` : String(error);
   }

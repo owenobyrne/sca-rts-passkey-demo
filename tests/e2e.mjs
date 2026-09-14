@@ -80,17 +80,16 @@ page.on('console', (message) => {
 
 const cdp = await context.newCDPSession(page);
 await cdp.send('WebAuthn.enable');
-const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', {
-  options: {
-    protocol: 'ctap2',
-    ctap2Version: 'ctap2_1',
-    transport: 'internal',
-    hasResidentKey: true,
-    hasUserVerification: true,
-    isUserVerified: true,
-    automaticPresenceSimulation: true,
-  },
-});
+const AUTHENTICATOR = {
+  protocol: 'ctap2',
+  ctap2Version: 'ctap2_1',
+  transport: 'internal',
+  hasResidentKey: true,
+  hasUserVerification: true,
+  isUserVerified: true,
+  automaticPresenceSimulation: true,
+};
+const { authenticatorId } = await cdp.send('WebAuthn.addVirtualAuthenticator', { options: AUTHENTICATOR });
 
 await page.goto(BASE, { waitUntil: 'networkidle' });
 
@@ -169,6 +168,27 @@ await page.check('#c-force');
 await page.click('#btn-assess');
 await page.waitForSelector('#sca-body .verdict');
 check('a PSP may authenticate despite an available exemption', /PSP choice/i.test(await page.locator('#sca-body .verdict p').textContent()));
+
+// --- enrolment on a browser with no PaymentRequest -------------------------
+// The SPC `payment` extension makes create() throw NotSupportedError on a user
+// agent without SPC, so the request must not carry it there.
+// A separate context so it starts with empty storage and its own authenticator.
+const bareContext = await browser.newContext();
+const bare = await bareContext.newPage();
+bare.on('pageerror', (error) => pageErrors.push(error.message));
+const bareCdp = await bareContext.newCDPSession(bare);
+await bareCdp.send('WebAuthn.enable');
+await bareCdp.send('WebAuthn.addVirtualAuthenticator', { options: AUTHENTICATOR });
+await bare.addInitScript(() => {
+  delete window.PaymentRequest;
+});
+await bare.goto(BASE, { waitUntil: 'networkidle' });
+await bare.click('#btn-register');
+await bare.waitForSelector('.cred h3', { timeout: 20000 });
+const bareLog = await bare.locator('#audit-log').innerText();
+check('enrols on a browser without PaymentRequest', /no payment extension/.test(bareLog), bareLog.slice(0, 300));
+check('SPC extension is omitted rather than retried into', !/with the SPC payment extension/.test(bareLog));
+await bareContext.close();
 
 check('no uncaught page errors', pageErrors.length === 0, pageErrors.join(' | '));
 
