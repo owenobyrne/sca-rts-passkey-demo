@@ -175,7 +175,7 @@ export class BankServer {
     };
   }
 
-  async finishRegistration(credential) {
+  async finishRegistration(credential, { paymentExtensionRequested = false } = {}) {
     const response = credential.response;
     const clientDataJson = textDecoder.decode(response.clientDataJSON);
     const clientData = JSON.parse(clientDataJson);
@@ -242,7 +242,10 @@ export class BankServer {
       backupEligible: authData.flags.backupEligible,
       backupState: authData.flags.backupState,
       residentKey: extensions.credProps?.rk ?? null,
-      paymentCapable: Boolean(extensions.payment),
+      // Chrome does not echo the payment extension in the client extension
+      // results, so record what we asked for rather than claiming a capability
+      // we cannot observe. SPC is attempted and falls back regardless.
+      paymentExtensionRequested,
       keySource,
       createdAt: nowIso(),
     };
@@ -434,10 +437,16 @@ export class BankServer {
     if (isSpc) {
       const payment = clientData.payment ?? {};
       const authoritative = context?.transaction ?? executionPayload;
+      // The browser may normalise "150.00" to "150", so compare the value
+      // numerically; the currency still has to match exactly.
+      const displayedAmount = Number(payment.total?.value);
+      const authorisedAmount = Number(authoritative.amount);
       add(
         'spc-amount',
         'SPC-displayed amount is signed and matches the authorised amount',
-        payment.total?.value === authoritative.amount && payment.total?.currency === authoritative.currency
+        Number.isFinite(displayedAmount) &&
+        displayedAmount === authorisedAmount &&
+        payment.total?.currency === authoritative.currency
           ? PASS
           : FAIL,
         `displayed ${payment.total?.value} ${payment.total?.currency}; authorised ${authoritative.amount} ${authoritative.currency}`,

@@ -26,6 +26,7 @@ import {
 } from './sca-engine.js';
 import {
   authorisePlain,
+  authoriseWithSpc,
   createPasskey,
   friendlyWebauthnError,
   probeEnvironment,
@@ -191,6 +192,10 @@ const SCENARIOS = {
     formId: 'form-payment',
     subtitle: 'Initiating a credit transfer. SCA is in scope under PSD2 Art. 97(1)(b), with the Art. 13–18 exemptions in play.',
     bind: true,
+    // Secure Payment Confirmation renders a *payment*: a total and a payee.
+    // Only this scenario has either, which is why the trusted display is not
+    // available for a beneficiary change however much it would help there.
+    spc: true,
     exemptAction: 'Execute without SCA (use the exemption)',
     tampering: [
       { value: 'none', label: 'No tampering — honest submission' },
@@ -311,6 +316,7 @@ function renderCredentials() {
         `<span class="chip">${esc(c.algLabel)}</span>`,
         c.transports?.length ? `<span class="chip">${esc(c.transports.join(', '))}</span>` : '',
         c.residentKey ? '<span class="chip good">discoverable</span>' : '',
+        c.paymentExtensionRequested ? '<span class="chip good">SPC-eligible</span>' : '',
         c.backupEligible
           ? `<span class="chip warn">BE=1 BS=${c.backupState ? 1 : 0} (synced)</span>`
           : '<span class="chip">device-bound</span>',
@@ -397,7 +403,9 @@ async function onRegister() {
 
     if (!credential) throw lastError ?? new Error('No registration variant was accepted.');
 
-    const result = await server.finishRegistration(credential);
+    const result = await server.finishRegistration(credential, {
+      paymentExtensionRequested: accepted.tuning.payment === true,
+    });
     $('reg-result').innerHTML = renderChecklist(result.checks);
     if (result.ok) {
       log('good', `Passkey enrolled (${result.record.algLabel}) via ${result.record.keySource}`);
@@ -629,32 +637,72 @@ function renderAuthorise(subject, challenge) {
          <p>An unbound challenge cannot detect a rewritten payload — there is no commitment to compare against. For a sign-in that is fine, because the server decides the session’s scope from its own records rather than from the request. The moment an action carries an amount or a payee, that stops being true and binding becomes necessary.</p>
        </div>`;
 
+  // The trusted-display step-up, where the browser can provide one.
+  const spcOffered = Boolean(scenario.spc) && env.spc;
+  const spcNote = scenario.spc
+    ? spcOffered
+      ? `<p class="hint"><strong>Step up available.</strong> Secure Payment Confirmation has the browser — not this page — render the amount and payee, and sign those same values into <code>clientDataJSON</code>. A compromised page cannot then display one figure and sign another. It still trusts the browser and the device; it is a narrower guarantee than a second device, not a replacement for one.</p>`
+      : `<p class="hint">Secure Payment Confirmation is unavailable in this browser, so the confirmation above is rendered by the page. That satisfies Art. 5(1)(a), but the display is only as trustworthy as the page showing it — see “What this does not protect against” below.</p>`
+    : `<p class="hint">Secure Payment Confirmation renders a total and a payee, so there is no trusted-display step-up for this action. Where a beneficiary change warrants one, it has to come from a second device with its own display.</p>`;
+
   $('auth-body').innerHTML = `
     ${attack}
     <div class="row">
-      <button type="button" class="btn primary" id="btn-auth-plain">Authorise with passkey</button>
+      ${spcOffered ? '<button type="button" class="btn primary" id="btn-auth-spc">Authorise with Secure Payment Confirmation</button>' : ''}
+      <button type="button" class="btn ${spcOffered ? '' : 'primary'}" id="btn-auth-plain">Authorise with passkey</button>
       <button type="button" class="btn ghost" id="btn-replay" disabled>Replay the last authorisation</button>
     </div>
+    ${spcNote}
     <p class="hint">Compare with an SMS code: it would be equally valid typed into a lookalike domain, read out over the phone, or intercepted after a SIM swap. This assertion is useless anywhere but ${esc(env.origin)}.</p>`;
 
+  $('btn-auth-spc')?.addEventListener('click', () => authorise(subject, challenge, { preferSpc: true }));
   $('btn-auth-plain').addEventListener('click', () => authorise(subject, challenge));
   $('btn-replay').addEventListener('click', () => replay());
   refreshGates();
 }
 
-async function authorise(subject, challenge) {
+async function authorise(subject, challenge, { preferSpc = false } = {}) {
   const scenario = current();
-  const button = $('btn-auth-plain');
-  button.disabled = true;
+  const buttons = ['btn-auth-spc', 'btn-auth-plain'].map($).filter(Boolean);
+  buttons.forEach((b) => (b.disabled = true));
 
   try {
-    log('step', 'navigator.credentials.get() — userVerification: required');
-    const { assertion } = await authorisePlain({
-      challengeBytes: challenge.challengeBytes,
-      allowCredentials: challenge.allowCredentials,
-      rpId: challenge.rpId,
-      timeout: challenge.timeout,
-    });
+    let assertion;
+    let usedSpc = false;
+
+    if (preferSpc) {
+      try {
+        log('step', 'PaymentRequest("secure-payment-confirmation") — the browser renders and signs the amount and payee');
+        const result = await authoriseWithSpc({
+          challengeBytes: challenge.challengeBytes,
+          credentialIds: server.credentials.map((c) => b64uDecode(c.credentialId)),
+          rpId: challenge.rpId,
+          payeeName: subject.payee.name,
+          amount: subject.amount,
+          currency: subject.currency,
+          instrumentLabel: 'Demo Portal account ••4321',
+        });
+        assertion = result.assertion;
+        usedSpc = true;
+      } catch (error) {
+        // SPC is an enhancement, never a dependency: a browser that cannot do
+        // it, a credential enrolled without the payment extension, or a
+        // customer who dismissed the sheet must all still be able to pay.
+        log('warn', `SPC unavailable (${friendlyWebauthnError(error)}) — falling back to plain WebAuthn with the page-rendered confirmation`);
+      }
+    }
+
+    if (!assertion) {
+      log('step', 'navigator.credentials.get() — userVerification: required');
+      const result = await authorisePlain({
+        challengeBytes: challenge.challengeBytes,
+        allowCredentials: challenge.allowCredentials,
+        rpId: challenge.rpId,
+        timeout: challenge.timeout,
+      });
+      assertion = result.assertion;
+    }
+    if (usedSpc) log('good', 'Assertion produced through the browser-rendered payment dialog');
 
     const mode = $('tamper-mode')?.value ?? 'none';
     const executionPayload = mode === 'none' || !scenario.applyTampering ? subject : scenario.applyTampering(subject, mode);
@@ -674,7 +722,7 @@ async function authorise(subject, challenge) {
       friendlyWebauthnError(error),
     )}</p></div></div>`;
   } finally {
-    button.disabled = false;
+    buttons.forEach((b) => (b.disabled = false));
   }
 }
 
@@ -753,8 +801,17 @@ function renderVerification(result, executionPayload, replayed) {
        </div>`
     : '';
 
+  const trustedDisplay =
+    result.clientData.type === 'payment.get'
+      ? `<div class="basis">
+           <span class="basis-art">SPC</span>
+           <span>The amount and payee in this assertion were rendered by the browser, not by the page, and signed into <code>clientDataJSON</code> as <code>clientData.payment</code>. The checks below compare those displayed values against the server's authoritative record — so a page that lied about what it was asking for would be caught here rather than trusted.</span>
+         </div>`
+      : '';
+
   $('verify-body').innerHTML = `
     ${verdict}
+    ${trustedDisplay}
     ${hashes}
     ${renderChecklist(result.checks)}
     <div class="stack">
@@ -910,8 +967,9 @@ function exportAudit() {
 
 function refreshGates() {
   const hasCredential = server.credentials.length > 0;
-  const button = $('btn-auth-plain');
-  if (button) {
+  for (const id of ['btn-auth-plain', 'btn-auth-spc']) {
+    const button = $(id);
+    if (!button) continue;
     button.disabled = !hasCredential;
     button.title = hasCredential ? '' : 'Enrol a passkey first (step 1).';
   }
@@ -926,6 +984,7 @@ function renderEnvBadges() {
     { ok: env.webauthn, label: `WebAuthn: ${env.webauthn ? 'available' : 'missing'}` },
     { ok: env.platformAuthenticator, label: `platform authenticator: ${env.platformAuthenticator ? 'yes' : 'no'}`, warnIfNo: true },
     { ok: env.conditionalMediation, label: `passkey autofill: ${env.conditionalMediation ? 'yes' : 'no'}`, warnIfNo: true },
+    { ok: env.spc, label: `Secure Payment Confirmation: ${env.spc ? 'yes' : 'no'}`, warnIfNo: true },
   ];
   $('env-badges').innerHTML = items
     .map((item) => `<li class="${item.neutral ? '' : item.ok ? 'ok' : item.warnIfNo ? 'warn' : 'no'}">${esc(item.label)}</li>`)

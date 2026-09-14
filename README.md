@@ -130,6 +130,24 @@ result the same way. Signing in commits nothing, because there is nothing to com
 challenge is 32 random bytes, and the session's scope is decided by the server from its own
 records rather than from anything the client submits.
 
+## What this does not protect against
+
+The passkey prompt shows the *site*, not the transaction. WebAuthn's trusted UI answers *who are
+you authenticating to*, never *what are you approving* — the amount and payee come from the page,
+which is exactly the component you might not trust.
+
+Dynamic linking therefore defeats tampering that happens **after** the action reaches the server's
+authoritative record: a modified request body, a tampered API hop, a replayed assertion, a mix-up
+between what was authorised and what gets executed. It does **not** defeat a compromised page:
+hostile script initiates €15,000, the server mints a challenge committing to €15,000, the page
+displays €150, the customer approves a prompt that mentions neither, and every check goes green.
+The binding ties the code to what the *server* was told, not to what the *human* saw.
+
+Secure Payment Confirmation narrows the gap by moving the display into the browser. A second
+device with its own display closes it. And note that an SMS containing the amount and payee is an
+independent display channel that passkeys give up — an argument for passkeys plus a second-channel
+confirmation above a value threshold, not for keeping SMS.
+
 ## Your fallback is your real security level
 
 A phishing-resistant passkey with an SMS reset path is a phishable system: the attacker simply
@@ -158,10 +176,14 @@ step-up by what the action converts into: beneficiary creation deserves the stro
    `extensions: { payment: { isPayment: true } }` — and that extension must only be sent where the
    browser exposes `PaymentRequest`, because the SPC specification has `create()` throw
    `NotSupportedError` on a user agent without SPC. Ask for it unconditionally and you do not
-   merely lose SPC, you lose enrolment. SPC is Chromium-only today, so treat it as an enhancement:
-   this demo requests it only where it can work, steps enrolment down through fewer options if the
-   browser still refuses, and falls back to plain WebAuthn with a page-rendered confirmation panel.
-   The challenge binding is identical either way.
+   merely lose SPC, you lose enrolment.
+
+   SPC's headline purpose is cross-origin — a merchant invoking a bank's credential — which a
+   first-party portal does not need. Its *second* property is the one that matters here: the
+   browser renders the amount and payee and signs those same values, so a compromised page cannot
+   display one figure and sign another. The demo offers it as a step-up on the payment flow where
+   available, falling back to plain WebAuthn with a page-rendered panel. Chromium-only, so it is
+   an enhancement and never the control. The challenge binding is identical either way.
 
 3. **Hashing the transaction is only half of dynamic linking** — see the re-hash step above.
 

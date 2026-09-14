@@ -210,6 +210,12 @@ await page.click('#btn-proceed-sca');
 await page.waitForSelector('#confirm-panel');
 check('Art. 5(1)(a) panel shows the amount', (await page.locator('#confirm-panel .amount').textContent()).includes('150'));
 check('Art. 5(1)(a) panel shows the payee', (await page.locator('#confirm-panel .payee').textContent()).includes('Merchant XYZ Ltd'));
+check('no SPC button when the browser cannot do it', (await page.locator('#btn-auth-spc').count()) === 0);
+check(
+  'the page explains why the confirmation is only page-rendered',
+  /only as trustworthy as the page/.test(await page.locator('#auth-body').innerText()),
+  await page.locator('#auth-body').innerText(),
+);
 
 await page.selectOption('#tamper-mode', 'none');
 await page.click('#btn-auth-plain');
@@ -290,6 +296,68 @@ const bareLog = await bare.locator('#audit-log').innerText();
 check('enrols on a browser without PaymentRequest', /no payment extension/.test(bareLog), bareLog.slice(0, 300));
 check('SPC extension is omitted rather than retried into', !/with the SPC payment extension/.test(bareLog));
 await bareContext.close();
+
+// --- Secure Payment Confirmation step-up -----------------------------------
+// Headless Chromium reports SPC as unavailable; the step-up path is driven
+// below with a stubbed PaymentRequest.
+const spcContext = await browser.newContext();
+const spcPage = await spcContext.newPage();
+const spcErrors = [];
+spcPage.on('pageerror', (error) => spcErrors.push(error.message));
+const spcCdp = await spcContext.newCDPSession(spcPage);
+await spcCdp.send('WebAuthn.enable');
+await spcCdp.send('WebAuthn.addVirtualAuthenticator', { options: AUTHENTICATOR });
+// A browser that advertises SPC but cannot complete it — the case that must
+// degrade to plain WebAuthn rather than stranding the customer.
+await spcPage.addInitScript(() => {
+  window.PaymentRequest = class {
+    constructor(methods, details) {
+      this.methods = methods;
+      this.details = details;
+    }
+    async canMakePayment() {
+      return true;
+    }
+    async show() {
+      throw new DOMException('no matching credential', 'NotAllowedError');
+    }
+  };
+});
+await spcPage.goto(BASE, { waitUntil: 'networkidle' });
+check('SPC is advertised in the environment badges', /Secure Payment Confirmation: yes/.test(await spcPage.locator('#env-badges').innerText()));
+
+await spcPage.click('#btn-register');
+await spcPage.waitForSelector('.cred h3', { timeout: 20000 });
+check('the credential records that the payment extension was requested', /SPC-eligible/.test(await spcPage.locator('#cred-list').innerText()));
+
+await spcPage.click('#scenarios .scenario[data-scenario="payment"]');
+await spcPage.click('#btn-assess');
+await spcPage.waitForSelector('#btn-proceed-sca');
+await spcPage.click('#btn-proceed-sca');
+await spcPage.waitForSelector('#btn-auth-plain');
+check('the SPC step-up is offered when the browser advertises it', (await spcPage.locator('#btn-auth-spc').count()) === 1);
+check('no SPC step-up is offered for a beneficiary change', await (async () => {
+  await spcPage.click('#scenarios .scenario[data-scenario="beneficiary"]');
+  await spcPage.click('#form-beneficiary button[type="submit"]');
+  await spcPage.waitForSelector('#btn-proceed-sca');
+  await spcPage.click('#btn-proceed-sca');
+  await spcPage.waitForSelector('#btn-auth-plain');
+  const none = (await spcPage.locator('#btn-auth-spc').count()) === 0;
+  await spcPage.click('#scenarios .scenario[data-scenario="payment"]');
+  await spcPage.click('#btn-assess');
+  await spcPage.waitForSelector('#btn-proceed-sca');
+  await spcPage.click('#btn-proceed-sca');
+  await spcPage.waitForSelector('#btn-auth-spc');
+  return none;
+})());
+
+await spcPage.click('#btn-auth-spc');
+await spcPage.waitForFunction(() => /executed|Merchant XYZ/.test(document.querySelector('#verify-body')?.textContent ?? ''), null, { timeout: 20000 });
+check('a failed SPC attempt falls back to plain WebAuthn', /falling back to plain WebAuthn/.test(await spcPage.locator('#audit-log').innerText()));
+const spcRows = await cells(spcPage, '#verify-body .checklist li');
+check('the fallback still produces a valid authorisation', spcRows.every((c) => c.state !== 'fail'), JSON.stringify(spcRows.filter((c) => c.state === 'fail')));
+check('no page errors on the SPC path', spcErrors.length === 0, spcErrors.join(' | '));
+await spcContext.close();
 
 // --- state written by an earlier version of the demo -----------------------
 // The three-scenario rewrite changed the ledger shape. State persists in
